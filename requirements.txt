@@ -1,0 +1,110 @@
+# =============================================================================
+# requirements.txt — Prebinary × UReap Integration
+# =============================================================================
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Notes:
+#   - torch is pinned to avoid breaking changes with sentence-transformers.
+#   - numpy is pinned below 2.0.0 for sentence-transformers compatibility.
+#   - pypdf is upgraded from 3.17.1 to resolve the ARC4 deprecation warning
+#     caused by the older version using a moved cryptography API.
+#   - PyPDF2 is retained alongside pypdf — both are used at different call
+#     sites (quiz_generator uses PyPDF2; pdf_utils and rag_utils use pypdf).
+#   - pydantic is retained as it is an indirect dependency of several packages
+#     including sentence-transformers and SQLAlchemy.
+# =============================================================================
+
+
+# ── Web application framework ─────────────────────────────────────────────────
+streamlit
+
+
+# ── Data manipulation and SQL ─────────────────────────────────────────────────
+pandas
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+# mysql-connector-python is used by db.py/auth.py for all transactional writes.
+# SQLAlchemy is required by pandas read_sql and Streamlit's st.data_editor.
+mysql-connector-python
+SQLAlchemy
+
+
+# ── Authentication ────────────────────────────────────────────────────────────
+bcrypt
+email-validator
+
+
+# ── HTTP client ───────────────────────────────────────────────────────────────
+# Used by llm_utils.py for all API calls to Groq, OpenAI, Gemini, and GitHub.
+requests
+
+
+# ── Environment variables ─────────────────────────────────────────────────────
+python-dotenv
+
+
+# ── LLM and vector search ─────────────────────────────────────────────────────
+# PyTorch is required by sentence-transformers and the FAISS embedding pipeline
+# used by the RAG and Advisor AI features. The torch patch block in app.py
+# resolves a Streamlit file-watcher compatibility issue with torch._classes.
+torch==2.1.2
+sentence-transformers==3.0.0
+faiss-cpu==1.7.4
+transformers==4.47.0
+huggingface_hub
+
+
+# ── UReap LLM provider SDKs ───────────────────────────────────────────────────
+groq==0.4.0
+google-generativeai==0.3.1
+
+
+# ── Document processing ───────────────────────────────────────────────────────
+# pypdf: used by pdf_utils.py and rag_utils.py.
+# PyPDF2: used by quiz_generator/document_processor.py.
+# Both are required — they serve different call sites.
+pypdf>=4.0.0
+PyPDF2==3.0.1
+python-docx==1.1.2
+python-pptx==1.0.2
+ppt2pdf>=0.0.3
+
+
+# ── PDF rendering and image extraction ───────────────────────────────────────
+# PyMuPDF (fitz) is used by narrated_slideshow/slide_visualizer.py to render
+# PDF pages as images for the slideshow preview.
+PyMuPDF>=1.26.0
+
+
+# ── Image handling ────────────────────────────────────────────────────────────
+Pillow==10.0.1
+
+
+# ── Narrated Slideshow — TTS and audio ───────────────────────────────────────
+gtts>=2.3.1
+pydub>=0.25.1
+mutagen>=1.46.0
+elevenlabs>=2.8.0
+cartesia>=2.0.2
+
+
+# ── Narrated Slideshow — video generation ────────────────────────────────────
+moviepy==1.0.3
+imageio-ffmpeg>=0.4.7
+
+
+# ── Web scraping (Advisor AI) ────────────────────────────────────────────────
+beautifulsoup4==4.13.4
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+numpy<2.0.0
+pyarrow==14.0.1
+pydantic>=2.6.4
+scikit-learn==1.6.1
+tqdm==4.66.1
+python-magic==0.4.27
+zipfile38==0.0.3

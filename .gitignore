@@ -1,0 +1,64 @@
+# Python generated files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Virtual environment
+venv/
+venv2/
+ENV/
+.env
+.venv/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.cursor/
+
+
+# Streamlit
+.streamlit/
+
+# Project specific
+temp_uploads/
+grading_results.csv
+keys.txt
+
+# Data files (uncomment if you don't want to include data files in your repository)
+# data/
+# *.npy
+# *.index
+# *.json
+
+# MacOS
+.DS_Store
+**/.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
