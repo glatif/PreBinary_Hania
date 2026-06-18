@@ -1,0 +1,45 @@
+# Core dependencies
+faiss-cpu==1.7.4
+pypdf==3.17.1
+streamlit==1.29.0
+python-dotenv==1.0.0
+pandas==2.1.1
+Pillow==10.0.1
+
+# LLM and vector database
+transformers==4.47.0
+torch==2.1.2
+sentence-transformers==3.0.0
+
+# File handling
+python-magic==0.4.27
+zipfile38==0.0.3
+PyPDF2==3.0.1
+python-docx==1.1.2
+python-pptx==1.0.2
+ppt2pdf>=0.0.3
+
+# HTTP requests
+requests==2.31.0
+beautifulsoup4==4.13.4
+
+# Utilities
+tqdm==4.66.1
+numpy<2.0.0
+pyarrow==14.0.1
+pydantic>=2.6.4
+scikit-learn==1.6.1
+
+# API integrations
+google-generativeai==0.3.1
+groq==0.4.0
+
+# Text-to-Speech and Audio processing
+gtts>=2.3.1
+pydub>=0.25.1
+mutagen>=1.46.0
+cartesia>=2.0.2
+elevenlabs>=2.8.0
+
+# Slide visualization
+PyMuPDF>=1.26.0
