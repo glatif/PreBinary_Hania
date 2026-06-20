@@ -60,6 +60,7 @@ from src.features.quiz_generator.quiz_generator import (
     create_word_document_questions_only,
     create_word_document_with_answers,
 )
+from src.features.exam_verification.exam_verification_feature import verify_student_identity
 
 
 # =============================================================================
@@ -761,6 +762,17 @@ def render_quiz_interface_tab() -> None:
     if not questions:
         st.error("❌ No questions available. Please regenerate the quiz.")
         return
+
+    # ---- Identity verification gate (students only) ----
+    # Instructors previewing their own generated quiz are not gated — only
+    # students taking the quiz for an actual attempt must verify. Keyed by
+    # quiz_current_db_id (the practice_quiz_generated row for this quiz) so
+    # a fresh verification is required if the student generates a new quiz.
+    user = st.session_state.get("user", {})
+    if user.get("role") == "student":
+        quiz_gate_id = st.session_state.get("quiz_current_db_id") or "session"
+        if not verify_student_identity(user, gate_key=f"practice_quiz_{quiz_gate_id}"):
+            return
 
     # Quiz metadata summary
     metadata = quiz_data.get("metadata", {})

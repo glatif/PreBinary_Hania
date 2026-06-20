@@ -198,6 +198,34 @@ def validate_postal_code(value: str) -> str | None:
 
 
 # =============================================================================
+# ROLL NUMBER  (optional, students only)
+# =============================================================================
+
+_ROLL_NO_RE = re.compile(r'^[A-Za-z0-9\-/]{1,50}$')
+
+
+def validate_roll_no(value: str) -> str | None:
+    """
+    Validate a student roll/registration number.
+
+    Optional everywhere it appears. When provided: 1–50 characters of
+    letters, digits, hyphens, or forward slashes — covers common
+    institutional formats (e.g. "2023-CS-101", "21/SE/045").
+
+    Returns None on success (including when empty), error string on failure.
+    """
+    v = _none_or_str(value)
+    if not v:
+        return None  # optional
+    if not _ROLL_NO_RE.match(v):
+        return (
+            "Roll number must be 1–50 characters and contain only "
+            "letters, numbers, hyphens, or forward slashes."
+        )
+    return None
+
+
+# =============================================================================
 # API KEY  (optional)
 # =============================================================================
 

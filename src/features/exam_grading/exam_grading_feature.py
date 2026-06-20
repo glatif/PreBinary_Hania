@@ -35,9 +35,11 @@ import zipfile
 import tempfile
 from typing import List, Dict, Any
 from db import get_connection
+from auth import save_uploaded_file
 
 from src.utils.llm_utils import MODELS, generate_llm_response, MODEL_PROVIDERS, strip_llm_json
 from src.utils.pdf_utils import extract_text_from_pdf, save_uploaded_pdf
+from src.features.exam_verification.exam_verification_feature import verify_student_identity
 
 try:
     from docx import Document as DocxDocument
@@ -131,6 +133,207 @@ def save_exam_grading_result(
     finally:
         cursor.close()
         conn.close()
+
+
+# =============================================================================
+# STUDENT SUBMISSION — "Submit My Exam"
+# =============================================================================
+# Students upload their own completed exam file directly, after passing the
+# ID-card + live-selfie identity check. Files are written through the same
+# save_uploaded_file()/files-table mechanism every other feature uses, with
+# feature_name='exam_grading_submission' so the teacher's Student Submissions
+# tab can find exactly these rows. This is required (rather than session
+# state) because the student and the teacher are in separate browser
+# sessions — st.session_state cannot bridge across users.
+
+def save_student_exam_submission(
+    student_id: int,
+    assessment_id: int,
+    course_id: int,
+    file_bytes: bytes,
+    original_name: str,
+    course_name: str,
+    assessment_name: str,
+) -> None:
+    """Persist a verified student's own exam submission file."""
+    saved_name, saved_path = save_uploaded_file(
+        file_bytes=file_bytes,
+        original_name=original_name,
+        course_name=course_name,
+        assessment_name=assessment_name,
+        course_id=course_id,
+        feature_name="exam_grading_submission",
+    )
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO files (file_name, file_path, course_id, assessment_id, uploaded_by, feature_name)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (saved_name, saved_path, course_id, assessment_id, student_id, "exam_grading_submission"),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_student_exam_submissions(assessment_id: int, student_id: int = None) -> List[Dict]:
+    """
+    Return exam_grading_submission file rows for an assessment.
+
+    Filtered to one student's own files when student_id is given (the
+    student's own "already submitted" list), or all students' files when
+    omitted (the teacher's Student Submissions tab).
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        query = """
+            SELECT f.id, f.file_name, f.file_path, f.uploaded_at, f.uploaded_by,
+                   u.first_name, u.last_name, u.roll_no
+            FROM files f
+            JOIN users u ON u.id = f.uploaded_by
+            WHERE f.assessment_id = %s AND f.feature_name = 'exam_grading_submission'
+        """
+        params = [assessment_id]
+        if student_id is not None:
+            query += " AND f.uploaded_by = %s"
+            params.append(student_id)
+        query += " ORDER BY f.uploaded_at DESC"
+        cursor.execute(query, tuple(params))
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def save_exam_setup(
+    assessment_id: int,
+    questions: str,
+    rubric: str,
+    sub_rubric: str,
+    max_points: int,
+    set_by: int,
+) -> None:
+    """
+    Persist the canonical exam setup for an assessment so students can read
+    the questions (rubric/sub_rubric are stored for the grading pipeline but
+    are never shown to students). One row per assessment — upserted on every
+    save, since a teacher revising the exam should replace the prior version
+    rather than accumulate duplicates.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO exam_setups (assessment_id, questions, rubric, sub_rubric, max_points, set_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                questions  = VALUES(questions),
+                rubric     = VALUES(rubric),
+                sub_rubric = VALUES(sub_rubric),
+                max_points = VALUES(max_points),
+                set_by     = VALUES(set_by)
+            """,
+            (assessment_id, questions, rubric, sub_rubric, max_points, set_by),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_exam_setup(assessment_id: int) -> Dict:
+    """Return the saved exam setup for an assessment, or None if not yet saved."""
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT questions, rubric, sub_rubric, max_points, updated_at "
+            "FROM exam_setups WHERE assessment_id = %s",
+            (assessment_id,),
+        )
+        return cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _render_student_exam_submission(
+    course_id: int,
+    course_name: str,
+    assessment_id: int,
+    assessment_title: str,
+) -> None:
+    """
+    Student-facing "Submit My Exam" view, rendered instead of the full
+    teacher workflow when exam_grading_ui() detects a student role.
+
+    Exam questions are shown up front (no verification needed to read them —
+    a student may want to prepare their answers before opening the camera).
+    The upload form itself is gated by verify_student_identity() — it only
+    appears once the student has shown their ID card and a live selfie that
+    match their profile. One verification per assessment (cached in session
+    state by the gate_key) covers re-submission attempts within the same
+    session. The rubric/sub_rubric are intentionally never shown here — that
+    is the grading key.
+    """
+    user = st.session_state.user
+
+    st.markdown("### 📤 Submit My Exam")
+
+    if not assessment_id:
+        st.warning("Select a course and assessment first.")
+        return
+
+    setup = get_exam_setup(assessment_id)
+    if not setup or not setup.get("questions"):
+        st.info("Your instructor has not published the exam questions yet. Check back later.")
+        return
+
+    with st.expander("📋 Exam Questions", expanded=True):
+        st.caption(f"Maximum points: {setup.get('max_points', 100)}")
+        st.markdown(setup["questions"])
+
+    st.divider()
+
+    if not verify_student_identity(user, gate_key=f"exam_grading_{assessment_id}"):
+        return
+
+    st.success("Identity verified. You may now upload your exam.")
+
+    existing = get_student_exam_submissions(assessment_id, student_id=int(user["id"]))
+    if existing:
+        st.info(f"You have already submitted {len(existing)} file(s) for this assessment.")
+        for row in existing:
+            st.caption(f"`{row['file_name']}` — submitted {row['uploaded_at']}")
+
+    uploaded_file = st.file_uploader(
+        "Upload your completed exam (PDF, Word, DOC, TXT, or PowerPoint)",
+        type=SUPPORTED_SUBMISSION_TYPES,
+        key=f"student_exam_upload_{assessment_id}",
+    )
+    if uploaded_file and st.button(
+        "Submit Exam", type="primary", key=f"submit_exam_btn_{assessment_id}"
+    ):
+        try:
+            save_student_exam_submission(
+                student_id=int(user["id"]),
+                assessment_id=assessment_id,
+                course_id=course_id,
+                file_bytes=uploaded_file.read(),
+                original_name=uploaded_file.name,
+                course_name=course_name,
+                assessment_name=assessment_title,
+            )
+            st.success("Exam submitted successfully.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not submit your exam: {exc}")
 
 
 # =============================================================================
@@ -673,9 +876,15 @@ def exam_grading_ui() -> None:
     keys so that grading results and file uploads are linked to the correct
     assessment in the database.
 
+    Students get a single cut-down view instead of the tabs below: an
+    identity-verification-gated "Submit My Exam" upload (see
+    _render_student_exam_submission()). Everything from here down is the
+    teacher/admin workflow.
+
     Tab structure:
         Setup Exam          -- enter questions, rubric, and point total.
-        Student Submissions -- upload individual PDFs or a ZIP archive.
+        Student Submissions -- upload individual PDFs or a ZIP archive, or
+                                pull in files students submitted themselves.
         Grading Results     -- trigger LLM grading and view results.
         History             -- browse past grading sessions for this assessment.
     """
@@ -689,6 +898,10 @@ def exam_grading_ui() -> None:
     course_name      = _course.get("name", "")
     assessment_id    = _assessment.get("id")
     assessment_title = _assessment.get("title", "")
+
+    if st.session_state.get("user", {}).get("role") == "student":
+        _render_student_exam_submission(course_id, course_name, assessment_id, assessment_title)
+        return
 
     # Session state keys for this feature. Generic names match the original
     # session-based implementation so no downstream references need updating.
@@ -951,19 +1164,77 @@ def exam_grading_ui() -> None:
             value=st.session_state.max_points,
         )
 
-        if st.session_state.questions and st.button("Clear Exam Setup"):
-            st.session_state.questions = ""
-            st.session_state.rubric = ""
-            st.session_state.sub_rubric = ""
-            st.session_state.max_points = 100
-            st.session_state["eg_raw_extracted"] = ""
-            st.success("Exam setup cleared — upload a new question file or enter questions manually above.")
+        setup_col1, setup_col2 = st.columns(2)
+        with setup_col1:
+            if st.session_state.questions and st.button(
+                "💾 Save Exam Setup (visible to students)", type="primary"
+            ):
+                save_exam_setup(
+                    assessment_id=assessment_id,
+                    questions=st.session_state.questions,
+                    rubric=st.session_state.rubric,
+                    sub_rubric=st.session_state.sub_rubric,
+                    max_points=int(st.session_state.max_points),
+                    set_by=int(st.session_state["user"]["id"]),
+                )
+                st.success(
+                    "Exam setup saved — students can now see the questions in "
+                    "their Submit My Exam view."
+                )
+        with setup_col2:
+            if st.session_state.questions and st.button("Clear Exam Setup"):
+                st.session_state.questions = ""
+                st.session_state.rubric = ""
+                st.session_state.sub_rubric = ""
+                st.session_state.max_points = 100
+                st.session_state["eg_raw_extracted"] = ""
+                st.success("Exam setup cleared — upload a new question file or enter questions manually above.")
 
     # -------------------------------------------------------------------------
     # TAB 2 — Student Submissions
     # -------------------------------------------------------------------------
     with tab2:
         st.write("Upload student submissions")
+
+        # ---- Files students submitted themselves via "Submit My Exam" ----
+        # These come from a different browser session per student, so they
+        # are persisted to the files table rather than session state — pull
+        # them in here rather than requiring the teacher to re-collect and
+        # re-upload files students already submitted directly.
+        if assessment_id:
+            student_files = get_student_exam_submissions(assessment_id)
+            if student_files:
+                with st.expander(f"📥 Student-Submitted Files ({len(student_files)})", expanded=True):
+                    st.caption(
+                        "Uploaded directly by students after passing identity verification. "
+                        "Load them into the grading queue below."
+                    )
+                    for row in student_files:
+                        name = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip() or "Unknown"
+                        roll_suffix = f" (Roll No: {row['roll_no']})" if row.get("roll_no") else ""
+                        st.write(f"**{name}**{roll_suffix} — `{row['file_name']}`")
+
+                    if st.button("Load Student-Submitted Files into Grading Queue", key="load_student_files_btn"):
+                        with st.spinner("Processing student-submitted files..."):
+                            loaded = []
+                            for row in student_files:
+                                try:
+                                    content = extract_text_from_file(row["file_path"])
+                                    name = (
+                                        f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
+                                        or row["file_name"]
+                                    )
+                                    loaded.append({
+                                        "student_name": name,
+                                        "student_id":   row.get("roll_no") or "",
+                                        "filename":     row["file_name"],
+                                        "content":      content,
+                                    })
+                                except Exception as e:
+                                    st.error(f"Error processing {row['file_name']}: {str(e)}")
+                            st.session_state.submissions = loaded
+                            st.success(f"Loaded {len(loaded)} student-submitted file(s) into the grading queue.")
+                st.divider()
 
         if not st.session_state.questions or not st.session_state.rubric:
             st.warning("Please set up questions and rubric in the Setup Exam tab first.")

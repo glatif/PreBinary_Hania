@@ -122,6 +122,7 @@ from app_validators import (
     validate_text_field,
     validate_postal_code,
     validate_api_key,
+    validate_roll_no,
 )
 from auth import (
     signup_user,
@@ -135,6 +136,7 @@ from auth import (
     admin_create_user,
     admin_update_user_full,
     is_phone_unique,
+    is_roll_no_unique,
     is_username_unique_for_update,
     is_email_unique_for_update,
     update_user_api_keys,
@@ -300,7 +302,7 @@ if "selected_course" not in st.session_state:
 if "selected_assessment" not in st.session_state:
     st.session_state.selected_assessment = None
 
-# Per-tab navigation state for the three course-integrated feature tabs.
+# Per-tab navigation state for the four course-integrated feature tabs.
 # Each tab maintains independent view_level, selected_course, and
 # selected_assessment so that navigating into a course under one tab
 # does not affect the navigation state of any other tab.
@@ -774,6 +776,11 @@ def dialog_edit_user(user_row):
             edit_phone = st.text_input("Phone", value=user_row.get("phone") or "")
         with p2:
             edit_last = st.text_input("Last Name", value=user_row.get("last_name") or "")
+            edit_roll = st.text_input(
+                "Roll Number",
+                value=user_row.get("roll_no") or "",
+                help="Checked against the student's ID card at exam submission time.",
+            )
 
         st.divider()
         edit_street, edit_city, edit_state, edit_postal, edit_country = render_address_fields(
@@ -894,6 +901,7 @@ def dialog_edit_user(user_row):
         edit_state    = edit_state.strip()
         edit_postal   = edit_postal.strip()
         edit_country  = edit_country.strip()
+        edit_roll     = edit_roll.strip()    or None
         edit_chatgpt  = edit_chatgpt.strip() or None
         edit_gemini   = edit_gemini.strip()  or None
         edit_groq     = edit_groq.strip()    or None
@@ -905,6 +913,9 @@ def dialog_edit_user(user_row):
             street=edit_street, city=edit_city, state_prov=edit_state,
             postal_code=edit_postal, country=edit_country,
         )
+        roll_err = validate_roll_no(edit_roll)
+        if roll_err:
+            errors.append(roll_err)
         if errors:
             show_errors(errors)
             return
@@ -931,6 +942,9 @@ def dialog_edit_user(user_row):
         if edit_phone and not is_phone_unique(edit_phone, exclude_id=u_id):
             st.error("That phone number is already used by another user.")
             return
+        if edit_roll and not is_roll_no_unique(edit_roll, exclude_id=u_id):
+            st.error("That roll number is already used by another user.")
+            return
 
         try:
             admin_update_user_full(
@@ -942,6 +956,7 @@ def dialog_edit_user(user_row):
                 chatgpt_key=edit_chatgpt, gemini_key=edit_gemini,
                 groq_key=edit_groq, github_token=edit_github,
                 elevenlabs_key=None, cartesia_key=None,
+                roll_no=edit_roll,
                 pref_rag           = LLM_MODELS[edit_pref_rag],
                 pref_exam_grading  = LLM_MODELS[edit_pref_exam_grading],
                 pref_exam_creation = LLM_MODELS[edit_pref_exam_creation],
@@ -1501,6 +1516,19 @@ def profile_page():
             with nc2:
                 ph = st.text_input("Phone (optional)", value=user.get("phone") or "")
 
+            # Roll number is only meaningful for student accounts — it is the
+            # identifier checked against the student's physical ID card during
+            # exam-submission identity verification.
+            if user.get("role") == "student":
+                roll = st.text_input(
+                    "Roll Number",
+                    value=user.get("roll_no") or "",
+                    help="Must match the roll number printed on your ID card — "
+                         "this is checked at exam submission time.",
+                )
+            else:
+                roll = user.get("roll_no") or ""
+
             st.divider()
             strt, cty, stt, zp, cnt = render_address_fields(
                 "profile",
@@ -1523,6 +1551,7 @@ def profile_page():
             stt  = stt.strip()
             zp   = zp.strip()
             cnt  = cnt.strip()
+            roll = roll.strip() or None
 
             profile_errors = []
             for err in [
@@ -1534,6 +1563,7 @@ def profile_page():
                 validate_text_field(stt,  "State/Province", 100),
                 validate_postal_code(zp),
                 validate_text_field(cnt,  "Country",        100),
+                validate_roll_no(roll),
             ]:
                 if err:
                     profile_errors.append(err)
@@ -1542,14 +1572,16 @@ def profile_page():
                 show_errors(profile_errors)
             elif ph and not is_phone_unique(ph, exclude_id=int(user["id"])):
                 st.error("That phone number is already used by another user.")
+            elif roll and not is_roll_no_unique(roll, exclude_id=int(user["id"])):
+                st.error("That roll number is already used by another user.")
             else:
-                update_user_profile(user["id"], fn, ln, ph, strt, cty, stt, zp, cnt)
+                update_user_profile(user["id"], fn, ln, ph, strt, cty, stt, zp, cnt, roll)
                 # Keep session state in sync so the form pre-populates correctly
                 # without requiring a full page reload.
                 st.session_state.user.update({
                     "first_name": fn, "last_name": ln, "phone": ph,
                     "street_address": strt, "city": cty, "state_province": stt,
-                    "postal_code": zp, "country": cnt,
+                    "postal_code": zp, "country": cnt, "roll_no": roll,
                 })
                 st.toast("Profile saved.")
                 st.rerun()
@@ -1977,8 +2009,10 @@ def render_dashboard():
     ]
 
     # Labels excluded for students. Using a set for O(1) membership checks.
+    # Exam Grading is shown to students too — exam_grading_ui() renders a
+    # different, cut-down view for them (Submit My Exam) than the full
+    # teacher/admin setup-and-grade workflow.
     STUDENT_EXCLUDED = {
-        "📝 Exam Grading",
         "✨ Exam Creation",
     }
 
@@ -2073,6 +2107,7 @@ def _admin_users_tab(engine):
         text("""
             SELECT id, username, email, first_name, last_name,
                    phone, street_address, city, state_province, postal_code, country,
+                   roll_no,
                    chatgpt_api_key, gemini_api_key, groq_api_key, github_token,
                    elevenlabs_api_key, cartesia_api_key, role, status,
                    pref_model_rag, pref_model_exam_grading, pref_model_exam_creation,
@@ -2101,6 +2136,7 @@ def _admin_users_tab(engine):
                 new_email_in = st.text_input("Email")
                 new_status   = st.selectbox("Status", ["active", "inactive"], index=1)
             new_role = st.selectbox("Role", ["user", "admin", "teacher", "student"], index=0)
+            new_roll = st.text_input("Roll Number (students only, optional)")
 
             st.divider()
             st.markdown("**Contact & Address**")
@@ -2172,6 +2208,7 @@ def _admin_users_tab(engine):
         new_gemini   = new_gemini.strip()  or None
         new_groq     = new_groq.strip()    or None
         new_github   = new_github.strip()  or None
+        new_roll     = new_roll.strip()    or None
 
         errors = validate_user_form(
             username=new_user, email=new_email_in, password=new_pwd,
@@ -2179,6 +2216,9 @@ def _admin_users_tab(engine):
             street=new_street, city=new_city, state_prov=new_state,
             postal_code=new_postal, country=new_country,
         )
+        roll_err = validate_roll_no(new_roll)
+        if roll_err:
+            errors.append(roll_err)
         if errors:
             show_errors(errors)
         else:
@@ -2199,6 +2239,8 @@ def _admin_users_tab(engine):
                     st.error("That email address is already registered.")
                 elif new_phone and not is_phone_unique(new_phone):
                     st.error("That phone number is already registered.")
+                elif new_roll and not is_roll_no_unique(new_roll):
+                    st.error("That roll number is already registered.")
                 else:
                     try:
                         admin_create_user(
@@ -2207,6 +2249,7 @@ def _admin_users_tab(engine):
                             street=new_street, city=new_city, state_prov=new_state,
                             postal_code=new_postal, country=new_country,
                             role=new_role, status=new_status,
+                            roll_no=new_roll,
                             chatgpt_key=new_chatgpt, gemini_key=new_gemini,
                             groq_key=new_groq, github_token=new_github,
                             pref_rag           = LLM_MODELS[new_pref_rag],

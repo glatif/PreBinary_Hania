@@ -26,6 +26,7 @@ except ImportError:
 
 try:
     from ppt2pdf import main as ppt2pdf_main
+    import comtypes
     PPT2PDF_AVAILABLE = True
 except ImportError:
     PPT2PDF_AVAILABLE = False
@@ -50,6 +51,20 @@ def convert_ppt_to_pdf(ppt_file_path: str, output_dir: str) -> Optional[str]:
         log_debug("CONVERTER", "ERROR", "ppt2pdf library not available - requires Windows platform")
         return None
     
+    # comtypes.client.CreateObject (used inside ppt2pdf.main.convert) requires COM
+    # to be initialized on the calling thread. Streamlit runs the app script on a
+    # ScriptRunner worker thread, not the process main thread, so without this
+    # call CreateObject raises "CoInitialize has not been called" - silently
+    # caught below, which used to make PPT visual preview always fall back to
+    # placeholder images even though everything else (narration/audio) worked.
+    com_initialized = False
+    try:
+        comtypes.CoInitialize()
+        com_initialized = True
+    except OSError:
+        # Already initialized on this thread (e.g. by a prior call) - fine.
+        com_initialized = True
+
     try:
         log_debug("CONVERTER", "INFO", f"Converting PowerPoint to PDF: {ppt_file_path}")
 
@@ -74,10 +89,13 @@ def convert_ppt_to_pdf(ppt_file_path: str, output_dir: str) -> Optional[str]:
         else:
             log_debug("CONVERTER", "ERROR", f"PDF file not found after conversion: {pdf_path}")
             return None
-            
+
     except Exception as e:
         log_debug("CONVERTER", "ERROR", f"Error converting PowerPoint to PDF: {str(e)}")
         return None
+    finally:
+        if com_initialized:
+            comtypes.CoUninitialize()
 
 def extract_pdf_page_images(uploaded_file, max_pages: int = 25) -> Dict[int, bytes]:
     """
