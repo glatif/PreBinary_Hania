@@ -208,6 +208,29 @@ def is_email_unique_for_update(email: str, exclude_id: int) -> bool:
         conn.close()
 
 
+def is_roll_no_unique(roll_no: str, exclude_id: int = None) -> bool:
+    """
+    Return True if no other user has the given roll number.
+
+    The exclude_id parameter allows the check to skip the user currently being
+    edited, so their existing roll number does not trigger a false conflict.
+    """
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        if exclude_id:
+            cursor.execute(
+                "SELECT id FROM users WHERE roll_no = %s AND id != %s",
+                (roll_no.strip(), int(exclude_id)),
+            )
+        else:
+            cursor.execute("SELECT id FROM users WHERE roll_no = %s", (roll_no.strip(),))
+        return cursor.fetchone() is None
+    finally:
+        cursor.close()
+        conn.close()
+
+
 def is_course_code_unique(course_code: str, exclude_id: int = None) -> bool:
     """
     Return True if no existing course has the given course code.
@@ -452,12 +475,14 @@ def update_user_profile(
     state_prov: str,
     postal_code: str,
     country: str,
+    roll_no: str = None,
 ) -> None:
     """
     Update the non-sensitive profile fields for a user editing their own account.
 
     Username, email, role, status, and password are not touched here. Those
-    are handled by their own dedicated functions.
+    are handled by their own dedicated functions. roll_no is only meaningful
+    for student accounts and is stored as-is (None/blank clears it).
     """
     conn   = get_connection()
     cursor = conn.cursor()
@@ -472,10 +497,11 @@ def update_user_profile(
                 city           = %s,
                 state_province = %s,
                 postal_code    = %s,
-                country        = %s
+                country        = %s,
+                roll_no        = %s
             WHERE id = %s
             """,
-            (first_name, last_name, phone, street, city, state_prov, postal_code, country, user_id),
+            (first_name, last_name, phone, street, city, state_prov, postal_code, country, roll_no, user_id),
         )
         conn.commit()
     finally:
@@ -774,6 +800,7 @@ def admin_create_user(
     pref_wellness: str        = None,
     pref_quiz_generator: str  = None,
     pref_video_lectures: str  = None,
+    roll_no: str              = None,
 ) -> None:
     """
     Insert a new user record created directly by an admin.
@@ -792,6 +819,7 @@ def admin_create_user(
                 username, email, password,
                 first_name, last_name, phone,
                 street_address, city, state_province, postal_code, country,
+                roll_no,
                 chatgpt_api_key, gemini_api_key, groq_api_key,
                 github_token, elevenlabs_api_key, cartesia_api_key,
                 role, status,
@@ -800,6 +828,7 @@ def admin_create_user(
                 pref_model_quiz_generator, pref_model_video_lectures
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s)
             """,
@@ -815,6 +844,7 @@ def admin_create_user(
                 state_prov,
                 postal_code,
                 country,
+                roll_no,
                 chatgpt_key,
                 gemini_key,
                 groq_key,
@@ -865,6 +895,7 @@ def admin_update_user_full(
     pref_wellness: str        = None,
     pref_quiz_generator: str  = None,
     pref_video_lectures: str  = None,
+    roll_no: str              = None,
 ) -> None:
     """
     Update all editable fields for a user record, as performed by an admin.
@@ -891,6 +922,7 @@ def admin_update_user_full(
                 state_province            = %s,
                 postal_code               = %s,
                 country                   = %s,
+                roll_no                   = %s,
                 role                      = %s,
                 status                    = %s,
                 chatgpt_api_key           = %s,
@@ -919,6 +951,7 @@ def admin_update_user_full(
                 state_prov,
                 postal_code,
                 country,
+                roll_no,
                 role,
                 status,
                 chatgpt_key,

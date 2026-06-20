@@ -92,6 +92,11 @@ CREATE TABLE users (
     postal_code    VARCHAR(20),
     country        VARCHAR(100),
 
+    -- Student roll/registration number, shown on the institution-issued ID
+    -- card and checked against that card at exam-submission identity
+    -- verification time. NULL for non-student roles.
+    roll_no        VARCHAR(50)  NULL UNIQUE,
+
     -- AI provider API keys. chatgpt_api_key doubles as the OpenAI key for UReap
     -- (UReap reads st.session_state.openai_api_key, loaded from this column).
     chatgpt_api_key    VARCHAR(255)  NULL,
@@ -217,7 +222,8 @@ CREATE TABLE files (
     uploaded_by   INT          NOT NULL,
     -- feature_name identifies which feature uploaded this file, allowing each
     -- feature to list and manage only its own files within an assessment.
-    -- Values: 'general' (course files view), 'exam_creation', 'practice_quiz'.
+    -- Values: 'general' (course files view), 'exam_creation', 'practice_quiz',
+    -- 'exam_grading_submission' (student's own verified exam upload).
     -- NULL means the file predates this column and belongs to the general view.
     feature_name  VARCHAR(50)  NULL,
     uploaded_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
@@ -477,6 +483,36 @@ CREATE TABLE exam_grading_results (
 
     FOREIGN KEY (graded_by)     REFERENCES users(id)       ON DELETE CASCADE,
     FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 15B. EXAM SETUPS
+-- =============================================================================
+-- The canonical, persisted exam questions for an assessment, saved explicitly
+-- by the teacher from the Setup Exam tab ("Save Exam Setup" button) so that
+-- students can read the questions in their Submit My Exam view. Without this
+-- table the questions only ever existed in the teacher's own browser session
+-- state, invisible to students in their own separate session.
+--
+-- rubric/sub_rubric are stored here too (read by the grading pipeline) but
+-- are never shown to students — only `questions` and `max_points` are
+-- displayed in the student-facing view, since the rubric is the grading key.
+--
+-- One row per assessment (UNIQUE), upserted on every save.
+
+CREATE TABLE exam_setups (
+    id            INT  AUTO_INCREMENT PRIMARY KEY,
+    assessment_id INT  NOT NULL UNIQUE,
+    questions     TEXT NOT NULL,
+    rubric        TEXT,
+    sub_rubric    TEXT,
+    max_points    INT  DEFAULT 100,
+    set_by        INT  NOT NULL,
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+    FOREIGN KEY (set_by)        REFERENCES users(id)       ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

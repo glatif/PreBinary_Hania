@@ -100,6 +100,23 @@ imageio-ffmpeg>=0.4.7
 beautifulsoup4==4.13.4
 
 
+# ── Exam Submission Identity Verification ────────────────────────────────────
+# DeepFace performs the live-selfie vs ID-card face match. It is pinned to
+# tensorflow==2.15.0 specifically because that version resolves without
+# upgrading numpy or protobuf — newer TensorFlow/DeepFace combinations pull in
+# numpy>=2 and protobuf>=5, which break sentence-transformers (numpy<2,
+# pinned above) and google-generativeai==0.3.1 (requires protobuf<5).
+# DeepFace forces TF_USE_LEGACY_KERAS=1 internally, which requires the
+# separate tf-keras shim package below — without it, `from deepface import
+# DeepFace` fails with "No module named 'tensorflow.keras'".
+# EasyOCR reads the name/roll number printed on the ID card.
+tensorflow==2.15.0
+tf-keras==2.15.1
+deepface
+easyocr
+opencv-python-headless
+
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 numpy<2.0.0
 pyarrow==14.0.1

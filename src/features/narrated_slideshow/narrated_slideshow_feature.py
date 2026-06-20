@@ -533,13 +533,15 @@ def process_uploaded_document():
                 # Extract slide images for visual preview
                 log_debug("PROCESSING", "INFO", "Extracting slide images for preview")
                 file_type = st.session_state.slideshow_uploaded_file.type.lower()
-                
-                if 'pdf' in file_type:
+                file_name = st.session_state.slideshow_uploaded_file.name.lower()
+
+                if 'pdf' in file_type or file_name.endswith('.pdf'):
                     slide_images = extract_pdf_page_images(
                         st.session_state.slideshow_uploaded_file,
                         max_pages=25
                     )
-                elif 'presentation' in file_type or 'powerpoint' in file_type:
+                elif ('presentation' in file_type or 'powerpoint' in file_type
+                      or file_name.endswith('.pptx') or file_name.endswith('.ppt')):
                     slide_images = extract_ppt_slide_images(
                         st.session_state.slideshow_uploaded_file,
                         max_slides=20
