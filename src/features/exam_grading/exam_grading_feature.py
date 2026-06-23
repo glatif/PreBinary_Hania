@@ -40,6 +40,11 @@ from auth import save_uploaded_file
 from src.utils.llm_utils import MODELS, generate_llm_response, MODEL_PROVIDERS, strip_llm_json
 from src.utils.pdf_utils import extract_text_from_pdf, save_uploaded_pdf
 from src.features.exam_verification.exam_verification_feature import verify_student_identity
+from src.features.proctoring.proctoring_feature import (
+    render_proctor_monitor,
+    get_proctor_summary_by_user_assessment,
+    get_proctor_frames_by_user_assessment,
+)
 
 try:
     from docx import Document as DocxDocument
@@ -281,6 +286,13 @@ def _render_student_exam_submission(
     state by the gate_key) covers re-submission attempts within the same
     session. The rubric/sub_rubric are intentionally never shown here — that
     is the grading key.
+
+    Once verified, render_proctor_monitor() starts tab-switch/focus-loss
+    monitoring and the one-click screen-share prompt for the rest of this
+    render — the student has the questions in front of them and could switch
+    away to search for or draft answers before uploading, so monitoring
+    covers the whole window between verification and submission, not just
+    the upload click itself.
     """
     user = st.session_state.user
 
@@ -303,6 +315,13 @@ def _render_student_exam_submission(
 
     if not verify_student_identity(user, gate_key=f"exam_grading_{assessment_id}"):
         return
+
+    render_proctor_monitor(
+        gate_key=f"exam_grading_{assessment_id}",
+        user=user,
+        quiz_id=None,
+        assessment_id=assessment_id,
+    )
 
     st.success("Identity verified. You may now upload your exam.")
 
@@ -1203,7 +1222,12 @@ def exam_grading_ui() -> None:
         # re-upload files students already submitted directly.
         if assessment_id:
             student_files = get_student_exam_submissions(assessment_id)
-            if student_files:
+            if not student_files:
+                st.info(
+                    "No students have submitted through \"Submit My Exam\" for "
+                    "this assessment yet."
+                )
+            else:
                 with st.expander(f"📥 Student-Submitted Files ({len(student_files)})", expanded=True):
                     st.caption(
                         "Uploaded directly by students after passing identity verification. "
@@ -1213,6 +1237,34 @@ def exam_grading_ui() -> None:
                         name = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip() or "Unknown"
                         roll_suffix = f" (Roll No: {row['roll_no']})" if row.get("roll_no") else ""
                         st.write(f"**{name}**{roll_suffix} — `{row['file_name']}`")
+
+                        # Tab-switch/focus-loss and screen-share summary recorded
+                        # between this student's identity verification and their
+                        # upload, aggregated across all their proctoring sessions
+                        # for this assessment (see get_proctor_summary_by_user_assessment).
+                        proctor = get_proctor_summary_by_user_assessment(row["uploaded_by"], assessment_id)
+                        share_label = {
+                            "granted": "✅ granted",
+                            "denied":  "❌ denied",
+                            None:      "— not recorded",
+                        }[proctor["screen_share"]]
+                        violation_count = proctor["violation_count"]
+                        violation_icon  = "🔴" if violation_count else "🟢"
+                        st.caption(
+                            f"{violation_icon} {violation_count} tab-switch/focus warning(s) — "
+                            f"Screen share: {share_label}"
+                        )
+
+                        # Screen-share snapshots captured between verification
+                        # and upload, downscaled JPEGs taken every
+                        # CAPTURE_INTERVAL_MS — see proctoring_feature.py.
+                        frames = get_proctor_frames_by_user_assessment(row["uploaded_by"], assessment_id)
+                        if frames:
+                            with st.expander(f"📷 Screen Capture Frames ({len(frames)})", expanded=False):
+                                frame_cols = st.columns(4)
+                                for i, frame in enumerate(frames):
+                                    with frame_cols[i % 4]:
+                                        st.image(frame["file_path"], caption=str(frame["captured_at"]))
 
                     if st.button("Load Student-Submitted Files into Grading Queue", key="load_student_files_btn"):
                         with st.spinner("Processing student-submitted files..."):

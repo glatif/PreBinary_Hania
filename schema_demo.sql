@@ -673,11 +673,79 @@ CREATE TABLE practice_quiz_attempts (
     assessment_id INT   NULL,
     answers_json LONGTEXT NOT NULL,
     score        FLOAT  NULL,
+    -- proctor_session_id links this attempt to the tab-switch/screen-share
+    -- monitoring events recorded in quiz_proctor_events while the student was
+    -- taking the quiz (see QUIZ PROCTOR EVENTS below). NULL for attempts
+    -- taken before this feature existed, or for non-student preview attempts.
+    proctor_session_id VARCHAR(36) NULL,
     submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
     FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
     FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- QUIZ PROCTOR EVENTS
+-- =============================================================================
+-- Records tab-switch / window-focus-loss events and screen-share permission
+-- outcomes captured automatically while a student is taking a practice quiz
+-- (after they pass identity verification — see exam_verification_feature.py).
+--
+-- session_id is a UUID minted client-side (in proctoring_feature.py) the
+-- first time the monitor renders for a given quiz attempt-in-progress. It is
+-- generated before the practice_quiz_attempts row exists (the attempt row is
+-- only created on submission), so events are linked by session_id rather
+-- than attempt_id; the same session_id is stamped onto
+-- practice_quiz_attempts.proctor_session_id once the attempt is saved,
+-- letting instructors join the two.
+--
+-- event_type is one of: tab_hidden, tab_visible, window_blur, window_focus,
+-- screen_share_granted, screen_share_denied.
+
+CREATE TABLE quiz_proctor_events (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    session_id    VARCHAR(36)  NOT NULL,
+    user_id       INT          NOT NULL,
+    quiz_id       INT          NULL,
+    assessment_id INT          NULL,
+    event_type    VARCHAR(40)  NOT NULL,
+    created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- QUIZ PROCTOR FRAMES
+-- =============================================================================
+-- Periodic JPEG snapshots of a student's shared screen, captured client-side
+-- by proctoring_feature.py while a screen-share permission grant is active.
+-- The image bytes are written to disk under uploads/proctor_frames/; this
+-- table only stores the resulting file_path plus the same session_id/user_id/
+-- quiz_id/assessment_id linkage used by quiz_proctor_events, so instructors
+-- can review tab-switch events and screen snapshots together.
+--
+-- This is NOT continuous video — frames are captured at a fixed interval
+-- (see CAPTURE_INTERVAL_MS in proctoring_feature.py), not on every change.
+
+CREATE TABLE quiz_proctor_frames (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    session_id    VARCHAR(36)  NOT NULL,
+    user_id       INT          NOT NULL,
+    quiz_id       INT          NULL,
+    assessment_id INT          NULL,
+    file_path     VARCHAR(500) NOT NULL,
+    captured_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_frame_session (session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- =============================================================================
