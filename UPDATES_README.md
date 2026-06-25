@@ -12,8 +12,9 @@ This document summarises the latest updates made across the AI Instructor system
 * Advisor AI Feature
 * Narrated Slideshow Generator
 * Student Verification for Quiz Submission
+* Proctoring: Keystroke Tracking and Monitoring Data Controls
 
-The updates focus on improving upload flexibility, URL scraping, slideshow narration, video generation, and quiz submission verification.
+The updates focus on improving upload flexibility, URL scraping, slideshow narration, video generation, quiz submission verification, proctoring monitoring, and monitoring data management.
 
 ---
 
@@ -116,7 +117,43 @@ The initial student verification functionality has been added and pushed to Git.
 
 ---
 
-# 5. Overall Status
+# 5. Proctoring: Screen Sharing, Tab Switching and Keystroke Tracking and Monitoring Data Controls
+
+## Summary
+
+Keystroke tracking has been added to the existing proctoring workflow. This works alongside the current tab-switch/focus-loss detection and screen-share monitoring.
+
+The keystroke tracking is active from identity verification through final submission in both:
+
+* Practice Quiz flow
+* Exam Grading “Submit My Exam” flow
+
+## Current Status
+
+Keystrokes are batched and flushed client-side approximately every 15 seconds instead of being sent on every keypress. This helps reduce lag while the student is typing.
+
+Instructors can now review logged keystrokes alongside tab-switch counts and screen capture frames on the Student Attempts and Student Submissions screens.
+
+Admins and teachers can also permanently delete a student’s monitoring data directly from the review screen. This can be done:
+
+* Per attempt for Practice Quiz
+* Per assessment for Exam Grading
+
+This is in addition to the existing age-based bulk cleanup option in the Admin Panel.
+
+## Testing Still Required
+
+* Keystroke logging during full quiz and exam submission flows
+* Behaviour after identity verification
+* Client-side batching and flushing reliability
+* Instructor review screen display
+* Monitoring data deletion per attempt
+* Monitoring data deletion per assessment
+* Compatibility with existing age-based cleanup in the Admin Panel
+
+---
+
+# 6. Overall Status
 
 The main updates are working at a basic level, but further testing is still required before the features can be considered fully stable.
 
@@ -128,5 +165,7 @@ Current progress includes:
 * Website persistence for Advisor AI
 * Fixed video narration feature
 * Started student verification for quiz submission
+* Added keystroke tracking for proctoring
+* Added monitoring data controls for admins and teachers
 
 ---
