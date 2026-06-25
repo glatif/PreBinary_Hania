@@ -155,6 +155,7 @@ from src.features.advisor_ai.advisor_ai_feature import advisor_ai_ui
 from src.features.student_wellness.student_wellness_feature import student_wellness_ui
 from src.features.quiz_generator.quiz_generator_feature import quiz_generator_ui
 from src.features.narrated_slideshow.narrated_slideshow_feature import render_narrated_slideshow_feature
+from src.features.proctoring.proctoring_feature import cleanup_old_proctor_data
 
 # llm_utils.MODELS is referenced by the profile page to build per-feature model
 # preference selectors and to resolve stored model IDs back to display names.
@@ -2068,13 +2069,16 @@ def admin_panel_page():
     st.title("Admin Panel")
     engine = get_engine()
 
-    tab_users, tab_courses = st.tabs(["Users", "Courses"])
+    tab_users, tab_courses, tab_maintenance = st.tabs(["Users", "Courses", "Maintenance"])
 
     with tab_users:
         _admin_users_tab(engine)
 
     with tab_courses:
         _admin_courses_panel(engine)
+
+    with tab_maintenance:
+        _admin_maintenance_tab()
 
 
 def admin_page():
@@ -2087,6 +2091,39 @@ def admin_page():
     """
     st.title("Dashboard")
     render_dashboard()
+
+
+def _admin_maintenance_tab():
+    """
+    Admin Panel → Maintenance tab.
+
+    Currently holds a single on-demand action: purge proctoring data (tab-
+    switch/focus-loss events, screen-capture frame files, and keystroke logs)
+    older than a chosen retention window. This app has no background worker
+    or cron, so nothing deletes this data unless an admin clicks the button
+    here — see cleanup_old_proctor_data() in proctoring_feature.py for what
+    it does and why this data is treated as short-lived in the first place.
+    """
+    st.subheader("Proctoring Data Cleanup")
+    st.write(
+        "Tab-switch/focus-loss events, screen-capture frames, and keystroke "
+        "logs recorded during proctored quizzes and exam submissions. "
+        "Deleting them also removes the captured frame images from disk."
+    )
+    retention_days = st.number_input(
+        "Delete proctoring data older than (days)",
+        min_value=1, max_value=365, value=7,
+        help="Events, frames, and keystroke logs older than this many days will be permanently deleted.",
+    )
+    if st.button("Run Proctoring Data Cleanup", type="primary"):
+        with st.spinner("Cleaning up old proctoring data..."):
+            result = cleanup_old_proctor_data(retention_days=int(retention_days))
+        st.success(
+            f"Deleted {result['events_deleted']} event(s), "
+            f"{result['frames_deleted']} frame record(s), "
+            f"{result['keystrokes_deleted']} keystroke batch(es), and removed "
+            f"{result['files_removed']} image file(s) from disk."
+        )
 
 
 def _admin_users_tab(engine):

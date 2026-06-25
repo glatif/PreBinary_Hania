@@ -61,6 +61,14 @@ from src.features.quiz_generator.quiz_generator import (
     create_word_document_with_answers,
 )
 from src.features.exam_verification.exam_verification_feature import verify_student_identity
+from src.features.proctoring.proctoring_feature import (
+    render_proctor_monitor,
+    get_proctor_summary,
+    get_proctor_frames,
+    get_proctor_keystrokes,
+    format_keystrokes_for_display,
+    delete_proctor_session,
+)
 
 
 # =============================================================================
@@ -122,6 +130,7 @@ def save_quiz_attempt(
     assessment_id: int,
     answers: dict,
     score: float,
+    proctor_session_id: str = None,
 ) -> None:
     """
     Persist a student's completed quiz attempt to practice_quiz_attempts.
@@ -132,20 +141,26 @@ def save_quiz_attempt(
 
     assessment_id is stored directly on the attempt row so that instructor
     queries can filter by assessment without joining to practice_quiz_generated.
+
+    proctor_session_id links this attempt to the tab-switch/screen-share
+    monitoring events recorded by proctoring_feature.py while the student was
+    taking the quiz (None for non-student preview attempts, which are never
+    gated through the proctoring monitor).
     """
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
             INSERT INTO practice_quiz_attempts
-                (user_id, quiz_id, assessment_id, answers_json, score)
-            VALUES (%s, %s, %s, %s, %s)
+                (user_id, quiz_id, assessment_id, answers_json, score, proctor_session_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             quiz_id,
             assessment_id,
             json.dumps({str(k): v for k, v in answers.items()}),
             score,
+            proctor_session_id,
         ))
         conn.commit()
     finally:
@@ -313,6 +328,7 @@ def get_student_quiz_history(user_id: int, assessment_id: int) -> List[Dict]:
                 a.score,
                 a.submitted_at,
                 a.answers_json,
+                a.proctor_session_id,
                 g.mc_count,
                 g.tf_count,
                 g.sa_count,
@@ -333,6 +349,51 @@ def get_student_quiz_history(user_id: int, assessment_id: int) -> List[Dict]:
         conn.close()
 
 
+def get_latest_generated_quiz(user_id: int, assessment_id: int) -> Dict | None:
+    """
+    Return the most recently generated practice quiz for this user and
+    assessment, reshaped to match the quiz_data dict produced in-memory by
+    generate_multiple_question_types() (a "questions" list plus a "metadata"
+    dict), so it can be dropped straight into st.session_state.quiz_generated_questions.
+
+    Returns None if this user has never generated a quiz for this assessment.
+    Used by quiz_generator_ui() to restore an already-generated quiz when the
+    session state is empty (e.g. a new browser session) instead of forcing
+    the student to regenerate it from scratch every time.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT id, questions_json, mc_count, tf_count, sa_count,
+                   difficulty, topic_focus, model_used
+            FROM practice_quiz_generated
+            WHERE user_id = %s AND assessment_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (user_id, assessment_id))
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "id": row["id"],
+        "questions": json.loads(row["questions_json"]),
+        "metadata": {
+            "multiple_choice_count": row["mc_count"],
+            "true_false_count":      row["tf_count"],
+            "short_answer_count":    row["sa_count"],
+            "difficulty":            row["difficulty"],
+            "topic_filters":         row["topic_focus"],
+            "model_used":            row["model_used"],
+        },
+    }
+
+
 def get_all_attempts_for_assessment(assessment_id: int) -> List[Dict]:
     """
     Return all student attempts for a given assessment.
@@ -351,6 +412,7 @@ def get_all_attempts_for_assessment(assessment_id: int) -> List[Dict]:
                 a.score,
                 a.submitted_at,
                 a.answers_json,
+                a.proctor_session_id,
                 u.username,
                 u.first_name,
                 u.last_name,
@@ -413,6 +475,12 @@ def initialize_quiz_session_state() -> None:
     # not on every rerender while quiz_submitted remains True.
     if "quiz_attempt_saved" not in st.session_state:
         st.session_state.quiz_attempt_saved = False
+    # Tracks which assessment's quiz is currently loaded into the keys above,
+    # so quiz_generator_ui() can tell when it needs to (re)load from the DB —
+    # either because the session is fresh or because the student switched to
+    # a different assessment. See quiz_generator_ui().
+    if "quiz_loaded_for_assessment" not in st.session_state:
+        st.session_state.quiz_loaded_for_assessment = None
 
 
 # =============================================================================
@@ -771,8 +839,20 @@ def render_quiz_interface_tab() -> None:
     user = st.session_state.get("user", {})
     if user.get("role") == "student":
         quiz_gate_id = st.session_state.get("quiz_current_db_id") or "session"
-        if not verify_student_identity(user, gate_key=f"practice_quiz_{quiz_gate_id}"):
+        gate_key = f"practice_quiz_{quiz_gate_id}"
+        if not verify_student_identity(user, gate_key=gate_key):
             return
+
+        # Proctoring starts the instant verification passes, before any quiz
+        # content is shown. The returned session_id is stamped onto the
+        # attempt row when it is saved in display_quiz_results() below.
+        assessment_ctx = st.session_state.get("practice_quiz_selected_assessment") or {}
+        st.session_state["quiz_proctor_session_id"] = render_proctor_monitor(
+            gate_key=gate_key,
+            user=user,
+            quiz_id=st.session_state.get("quiz_current_db_id"),
+            assessment_id=assessment_ctx.get("id"),
+        )
 
     # Quiz metadata summary
     metadata = quiz_data.get("metadata", {})
@@ -991,6 +1071,7 @@ def display_quiz_results(questions: List[Dict[str, Any]]) -> None:
                 assessment_id=assessment_id,
                 answers=st.session_state.quiz_user_answers,
                 score=score_percentage,
+                proctor_session_id=st.session_state.get("quiz_proctor_session_id"),
             )
             st.session_state.quiz_attempt_saved = True
         except Exception as exc:
@@ -1219,6 +1300,51 @@ def render_instructor_attempts_tab(assessment_id: int) -> None:
                 f"SA: {attempt.get('sa_count', 0)}"
             )
 
+            # Proctoring summary — tab-switch/focus-loss count and the
+            # screen-share permission outcome recorded while this student was
+            # taking the quiz. proctor_session_id is None for attempts taken
+            # before this feature existed.
+            proctor = get_proctor_summary(attempt.get("proctor_session_id"))
+            share_label = {
+                "granted": "✅ granted",
+                "denied":  "❌ denied",
+                None:      "— not recorded",
+            }[proctor["screen_share"]]
+            violation_count = proctor["violation_count"]
+            violation_icon  = "🔴" if violation_count else "🟢"
+            mon_col1, mon_col2 = st.columns([5, 1])
+            with mon_col1:
+                st.write(
+                    f"**Monitoring:** {violation_icon} {violation_count} tab-switch/focus "
+                    f"warning(s) — Screen share: {share_label}"
+                )
+            with mon_col2:
+                if attempt.get("proctor_session_id") and st.button(
+                    "🗑️ Delete monitoring data",
+                    key=f"inst_del_proctor_{attempt_id}",
+                ):
+                    _dialog_delete_proctor_session(attempt["proctor_session_id"])
+
+            # Screen-share snapshots captured while the student had the quiz
+            # open, downscaled JPEGs taken every CAPTURE_INTERVAL_MS — see
+            # proctoring_feature.py. Not shown at all if sharing was never
+            # granted or no frames were captured.
+            frames = get_proctor_frames(attempt.get("proctor_session_id"))
+            if frames:
+                with st.expander(f"📷 Screen Capture Frames ({len(frames)})", expanded=False):
+                    frame_cols = st.columns(4)
+                    for i, frame in enumerate(frames):
+                        with frame_cols[i % 4]:
+                            st.image(frame["file_path"], caption=str(frame["captured_at"]))
+
+            # Keys pressed while the student had the quiz open, flushed in
+            # batches every KEYSTROKE_FLUSH_INTERVAL_MS — see
+            # proctoring_feature.py. Not shown at all if none were recorded.
+            keystrokes = get_proctor_keystrokes(attempt.get("proctor_session_id"))
+            if keystrokes:
+                with st.expander(f"⌨️ Keystrokes Logged ({len(keystrokes)})", expanded=False):
+                    st.text(format_keystrokes_for_display(keystrokes))
+
             # Display the source files used to generate this quiz so the
             # instructor can identify which study materials the student used.
             try:
@@ -1393,6 +1519,28 @@ def _dialog_delete_quiz_attempt(attempt_id: int) -> None:
         st.rerun()
 
 
+@st.dialog("Delete Monitoring Data")
+def _dialog_delete_proctor_session(session_id: str) -> None:
+    """
+    Confirmation modal for an instructor permanently deleting the tab-switch
+    events, screen-capture frames, and keystroke logs tied to one quiz
+    attempt's proctoring session — the attempt and its score are unaffected.
+    """
+    st.warning(
+        "Are you sure you want to delete the tab-switch/focus events, "
+        "screen-capture frames, and keystroke logs recorded for this "
+        "attempt? The attempt and its score are not affected. This cannot "
+        "be undone."
+    )
+    col1, col2 = st.columns(2)
+    if col1.button("Delete", type="primary", key="proctor_dialog_confirm_delete"):
+        delete_proctor_session(session_id)
+        st.toast("Monitoring data deleted.")
+        st.rerun()
+    if col2.button("Cancel", key="proctor_dialog_cancel_delete"):
+        st.rerun()
+
+
 def quiz_generator_ui() -> None:
     """
     Main entry point for the Practice Quiz feature.
@@ -1422,6 +1570,28 @@ def quiz_generator_ui() -> None:
     user_id          = st.session_state["user"]["id"]
     user_role        = st.session_state["user"].get("role", "")
     is_instructor    = user_role in ("admin", "teacher")
+
+    # Restore an already-generated quiz for this assessment instead of
+    # forcing a fresh upload-and-generate cycle every time. quiz_generated_questions
+    # otherwise lives only in session state, which is empty at the start of
+    # every new browser session even though the quiz itself is already saved
+    # in practice_quiz_generated. Re-checked whenever the selected assessment
+    # changes so a stale quiz from a different assessment is never shown.
+    if assessment_id and st.session_state.quiz_loaded_for_assessment != assessment_id:
+        st.session_state.quiz_generated_questions = None
+        st.session_state.quiz_analysis_complete   = False
+        st.session_state.quiz_current_db_id       = None
+        st.session_state.quiz_user_answers        = {}
+        st.session_state.quiz_submitted           = False
+        st.session_state.quiz_attempt_saved       = False
+
+        existing_quiz = get_latest_generated_quiz(user_id, assessment_id)
+        if existing_quiz:
+            st.session_state.quiz_generated_questions = existing_quiz
+            st.session_state.quiz_analysis_complete   = True
+            st.session_state.quiz_current_db_id       = existing_quiz["id"]
+
+        st.session_state.quiz_loaded_for_assessment = assessment_id
 
     st.markdown('<h2 class="feature-header">🧠 Quiz Generator</h2>', unsafe_allow_html=True)
     st.write(
