@@ -65,6 +65,9 @@ from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
     get_proctor_summary,
     get_proctor_frames,
+    get_proctor_keystrokes,
+    format_keystrokes_for_display,
+    delete_proctor_session,
 )
 
 
@@ -1309,10 +1312,18 @@ def render_instructor_attempts_tab(assessment_id: int) -> None:
             }[proctor["screen_share"]]
             violation_count = proctor["violation_count"]
             violation_icon  = "🔴" if violation_count else "🟢"
-            st.write(
-                f"**Monitoring:** {violation_icon} {violation_count} tab-switch/focus "
-                f"warning(s) — Screen share: {share_label}"
-            )
+            mon_col1, mon_col2 = st.columns([5, 1])
+            with mon_col1:
+                st.write(
+                    f"**Monitoring:** {violation_icon} {violation_count} tab-switch/focus "
+                    f"warning(s) — Screen share: {share_label}"
+                )
+            with mon_col2:
+                if attempt.get("proctor_session_id") and st.button(
+                    "🗑️ Delete monitoring data",
+                    key=f"inst_del_proctor_{attempt_id}",
+                ):
+                    _dialog_delete_proctor_session(attempt["proctor_session_id"])
 
             # Screen-share snapshots captured while the student had the quiz
             # open, downscaled JPEGs taken every CAPTURE_INTERVAL_MS — see
@@ -1325,6 +1336,14 @@ def render_instructor_attempts_tab(assessment_id: int) -> None:
                     for i, frame in enumerate(frames):
                         with frame_cols[i % 4]:
                             st.image(frame["file_path"], caption=str(frame["captured_at"]))
+
+            # Keys pressed while the student had the quiz open, flushed in
+            # batches every KEYSTROKE_FLUSH_INTERVAL_MS — see
+            # proctoring_feature.py. Not shown at all if none were recorded.
+            keystrokes = get_proctor_keystrokes(attempt.get("proctor_session_id"))
+            if keystrokes:
+                with st.expander(f"⌨️ Keystrokes Logged ({len(keystrokes)})", expanded=False):
+                    st.text(format_keystrokes_for_display(keystrokes))
 
             # Display the source files used to generate this quiz so the
             # instructor can identify which study materials the student used.
@@ -1497,6 +1516,28 @@ def _dialog_delete_quiz_attempt(attempt_id: int) -> None:
         st.toast("Attempt deleted.")
         st.rerun()
     if col2.button("Cancel", key="quiz_dialog_cancel_delete"):
+        st.rerun()
+
+
+@st.dialog("Delete Monitoring Data")
+def _dialog_delete_proctor_session(session_id: str) -> None:
+    """
+    Confirmation modal for an instructor permanently deleting the tab-switch
+    events, screen-capture frames, and keystroke logs tied to one quiz
+    attempt's proctoring session — the attempt and its score are unaffected.
+    """
+    st.warning(
+        "Are you sure you want to delete the tab-switch/focus events, "
+        "screen-capture frames, and keystroke logs recorded for this "
+        "attempt? The attempt and its score are not affected. This cannot "
+        "be undone."
+    )
+    col1, col2 = st.columns(2)
+    if col1.button("Delete", type="primary", key="proctor_dialog_confirm_delete"):
+        delete_proctor_session(session_id)
+        st.toast("Monitoring data deleted.")
+        st.rerun()
+    if col2.button("Cancel", key="proctor_dialog_cancel_delete"):
         st.rerun()
 
 

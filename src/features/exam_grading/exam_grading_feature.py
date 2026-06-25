@@ -44,6 +44,9 @@ from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
     get_proctor_summary_by_user_assessment,
     get_proctor_frames_by_user_assessment,
+    get_proctor_keystrokes_by_user_assessment,
+    format_keystrokes_for_display,
+    delete_proctor_data_for_user_assessment,
 )
 
 try:
@@ -886,6 +889,33 @@ def _dialog_delete_grading_session(grading_session_id: str, user_id: int) -> Non
         st.rerun()
 
 
+@st.dialog("Delete Monitoring Data")
+def _dialog_delete_proctor_data(user_id: int, assessment_id: int) -> None:
+    """
+    Confirmation modal for permanently deleting this student's tab-switch
+    events, screen-capture frames, and keystroke logs for this assessment.
+
+    Uploaded files aren't pinned to a single proctoring session_id (see
+    get_proctor_summary_by_user_assessment), so unlike the Practice Quiz
+    review this clears every proctoring session this student has had for
+    the assessment, not just one upload — submitted files themselves are
+    unaffected.
+    """
+    st.warning(
+        "Are you sure you want to delete ALL tab-switch/focus events, "
+        "screen-capture frames, and keystroke logs recorded for this "
+        "student across this entire assessment? Submitted files are not "
+        "affected. This cannot be undone."
+    )
+    col1, col2 = st.columns(2)
+    if col1.button("Delete", type="primary", key="eg_proctor_dialog_confirm_delete"):
+        delete_proctor_data_for_user_assessment(user_id, assessment_id)
+        st.toast("Monitoring data deleted.")
+        st.rerun()
+    if col2.button("Cancel", key="eg_proctor_dialog_cancel_delete"):
+        st.rerun()
+
+
 def exam_grading_ui() -> None:
     """
     Render the full Exam Grading feature UI.
@@ -1250,10 +1280,18 @@ def exam_grading_ui() -> None:
                         }[proctor["screen_share"]]
                         violation_count = proctor["violation_count"]
                         violation_icon  = "🔴" if violation_count else "🟢"
-                        st.caption(
-                            f"{violation_icon} {violation_count} tab-switch/focus warning(s) — "
-                            f"Screen share: {share_label}"
-                        )
+                        mon_col1, mon_col2 = st.columns([5, 1])
+                        with mon_col1:
+                            st.caption(
+                                f"{violation_icon} {violation_count} tab-switch/focus warning(s) — "
+                                f"Screen share: {share_label}"
+                            )
+                        with mon_col2:
+                            if st.button(
+                                "🗑️ Delete monitoring data",
+                                key=f"eg_del_proctor_{row['id']}",
+                            ):
+                                _dialog_delete_proctor_data(row["uploaded_by"], assessment_id)
 
                         # Screen-share snapshots captured between verification
                         # and upload, downscaled JPEGs taken every
@@ -1265,6 +1303,14 @@ def exam_grading_ui() -> None:
                                 for i, frame in enumerate(frames):
                                     with frame_cols[i % 4]:
                                         st.image(frame["file_path"], caption=str(frame["captured_at"]))
+
+                        # Keys pressed between verification and upload,
+                        # flushed in batches every KEYSTROKE_FLUSH_INTERVAL_MS
+                        # — see proctoring_feature.py.
+                        keystrokes = get_proctor_keystrokes_by_user_assessment(row["uploaded_by"], assessment_id)
+                        if keystrokes:
+                            with st.expander(f"⌨️ Keystrokes Logged ({len(keystrokes)})", expanded=False):
+                                st.text(format_keystrokes_for_display(keystrokes))
 
                     if st.button("Load Student-Submitted Files into Grading Queue", key="load_student_files_btn"):
                         with st.spinner("Processing student-submitted files..."):

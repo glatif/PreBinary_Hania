@@ -1,17 +1,18 @@
 # =============================================================================
 # proctoring_feature.py
 # =============================================================================
-# Lightweight, always-on tab-switch / window-focus-loss monitoring, plus an
-# optional screen-share permission prompt that — once granted — periodically
-# captures a downscaled JPEG snapshot of the shared screen and saves it to
-# disk, for the active quiz attempt that begins immediately after a student
-# clears the identity verification gate (see exam_verification_feature.py).
+# Lightweight, always-on tab-switch / window-focus-loss monitoring and
+# keystroke logging, plus an optional screen-share permission prompt that —
+# once granted — periodically captures a downscaled JPEG snapshot of the
+# shared screen and saves it to disk, for the active quiz attempt that begins
+# immediately after a student clears the identity verification gate (see
+# exam_verification_feature.py).
 #
 # Browser security constraints shape this design — they cannot be worked
 # around from application code:
-#   - document visibilitychange and window blur/focus events fire with no
-#     permission prompt, so that part of the monitor starts automatically and
-#     silently the instant the quiz screen renders.
+#   - document visibilitychange and window blur/focus events, and keydown
+#     events, fire with no permission prompt, so that part of the monitor
+#     starts automatically and silently the instant the quiz screen renders.
 #   - navigator.mediaDevices.getDisplayMedia() can only be invoked from a real
 #     user gesture (a click) and always raises the browser's own native
 #     "Share your screen" dialog — there is no way to start screen capture
@@ -34,26 +35,39 @@
 # total frames per screen-share session. Tune the constants below if you need
 # a different tradeoff.
 #
+# Keystrokes are handled the same way the tab-switch monitor's events are,
+# except batched rather than streamed: every keydown on the page is buffered
+# client-side and the whole buffer is flushed to Python every
+# KEYSTROKE_FLUSH_INTERVAL_MS (or sooner if MAX_KEYS_PER_BATCH is hit).
+# Sending each keypress individually — like the tab monitor does for
+# visibility/focus events — would mean a full Streamlit rerun per key, which
+# would make typing into any quiz text field visibly lag; batching avoids
+# that while still capturing every key. Any unflushed keys still in the
+# buffer when the tab is closed are lost — there is no reliable way to flush
+# a Streamlit component trigger value during page unload.
+#
 # Implementation note: this uses st.components.v2.component(), which mounts
 # inline JS directly into the app's own DOM (no iframe), so document/window
 # in the JS below refer to the real top-level page.
 #
-# All events and frames are written to quiz_proctor_events / quiz_proctor_frames,
-# keyed by a per-attempt session_id (a UUID minted the first time the monitor
+# All events, frames, and keystroke batches are written to
+# quiz_proctor_events / quiz_proctor_frames / quiz_proctor_keystrokes, keyed
+# by a per-attempt session_id (a UUID minted the first time the monitor
 # renders for a given quiz gate). The same session_id is stamped onto the
 # practice_quiz_attempts row at submission time (quiz_generator_feature.py) so
 # instructors can review the two together. Frame image files are written to
 # disk under uploads/proctor_frames/ — see save_proctor_frame().
 #
 # This data is meant to be short-lived: cleanup_old_proctor_data() deletes
-# events/frames (and their files on disk) past a retention window, and is
-# exposed as an on-demand "Run Proctoring Data Cleanup" button in the Admin
-# Panel's Maintenance tab (app.py) rather than running on its own — this app
-# has no background worker/cron, so nothing deletes data unless an admin (or
-# an external scheduler calling the same function) actually triggers it.
+# events/frames/keystrokes (and frame files on disk) past a retention window,
+# and is exposed as an on-demand "Run Proctoring Data Cleanup" button in the
+# Admin Panel's Maintenance tab (app.py) rather than running on its own — this
+# app has no background worker/cron, so nothing deletes data unless an admin
+# (or an external scheduler calling the same function) actually triggers it.
 # =============================================================================
 
 import base64
+import json
 import time
 import uuid
 from pathlib import Path
@@ -67,6 +81,10 @@ CAPTURE_INTERVAL_MS    = 20_000   # one frame every 20 seconds
 MAX_FRAME_DIMENSION_PX = 960      # downscale so the long edge is at most this
 JPEG_QUALITY           = 0.5      # 0-1, lower = smaller files
 MAX_FRAMES_PER_SESSION = 120      # hard cap (~40 minutes at the interval above)
+
+# ---- Keystroke-batch cadence/limits — tune to taste ----
+KEYSTROKE_FLUSH_INTERVAL_MS = 15_000   # flush the buffered keys every 15 seconds
+MAX_KEYS_PER_BATCH          = 500      # flush early if the buffer hits this size
 
 _PROCTOR_FRAMES_DIR = Path("uploads") / "proctor_frames"
 
@@ -90,6 +108,44 @@ export default function(component) {
         window.removeEventListener("focus", onFocus);
     };
 }
+"""
+
+_KEYSTROKE_JS = f"""
+export default function(component) {{
+    const {{ setTriggerValue }} = component;
+
+    const FLUSH_INTERVAL_MS = {KEYSTROKE_FLUSH_INTERVAL_MS};
+    const MAX_KEYS_PER_BATCH = {MAX_KEYS_PER_BATCH};
+
+    let buffer = [];
+
+    const flush = () => {{
+        if (buffer.length === 0) return;
+        const batch = buffer;
+        buffer = [];
+        setTriggerValue("keystrokes", {{ keys: batch }});
+    }};
+
+    const onKeyDown = (e) => {{
+        buffer.push({{
+            key: e.key,
+            ctrl: e.ctrlKey,
+            shift: e.shiftKey,
+            alt: e.altKey,
+            meta: e.metaKey,
+            t: Date.now(),
+        }});
+        if (buffer.length >= MAX_KEYS_PER_BATCH) flush();
+    }};
+
+    document.addEventListener("keydown", onKeyDown);
+    const intervalHandle = setInterval(flush, FLUSH_INTERVAL_MS);
+
+    return () => {{
+        document.removeEventListener("keydown", onKeyDown);
+        clearInterval(intervalHandle);
+    }};
+}}
 """
 
 _SCREEN_SHARE_JS = f"""
@@ -179,6 +235,7 @@ export default function(component) {{
 # definition itself on every rerun is not, which is why these live at module
 # scope rather than inside the function.
 _tab_monitor          = st.components.v2.component("quiz_tab_monitor", js=_TAB_MONITOR_JS)
+_keystroke_monitor    = st.components.v2.component("quiz_keystroke_monitor", js=_KEYSTROKE_JS)
 _screen_share_button  = st.components.v2.component("quiz_screen_share_button", js=_SCREEN_SHARE_JS)
 
 
@@ -200,6 +257,39 @@ def save_proctor_event(
             VALUES (%s, %s, %s, %s, %s)
             """,
             (session_id, user_id, quiz_id, assessment_id, event_type),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def save_proctor_keystrokes(
+    session_id: str,
+    user_id: int,
+    quiz_id,
+    assessment_id,
+    keys: list,
+) -> None:
+    """
+    Insert one batch of keystrokes (as flushed by _KEYSTROKE_JS) into
+    quiz_proctor_keystrokes as a single JSON-encoded row. Silently does
+    nothing for an empty batch — a missed flush should never break the quiz
+    for the student.
+    """
+    if not keys:
+        return
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO quiz_proctor_keystrokes
+                (session_id, user_id, quiz_id, assessment_id, keys_json)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (session_id, user_id, quiz_id, assessment_id, json.dumps(keys)),
         )
         conn.commit()
     finally:
@@ -390,11 +480,254 @@ def get_proctor_frames_by_user_assessment(user_id: int, assessment_id, limit: in
         conn.close()
 
 
+def get_proctor_keystrokes(session_id: str, limit: int = 200) -> list[dict]:
+    """
+    Return captured keystroke batches for one proctoring session, oldest
+    first, with each row's keys_json decoded back into a list of
+    {"key", "ctrl", "shift", "alt", "meta", "t"} dicts.
+    """
+    if not session_id:
+        return []
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+            SELECT keys_json, captured_at
+            FROM quiz_proctor_keystrokes
+            WHERE session_id = %s
+            ORDER BY captured_at ASC
+            LIMIT %s
+            """,
+            (session_id, limit),
+        )
+        rows = cursor.fetchall() or []
+    finally:
+        cursor.close()
+        conn.close()
+
+    return _decode_keystroke_rows(rows)
+
+
+def get_proctor_keystrokes_by_user_assessment(user_id: int, assessment_id, limit: int = 200) -> list[dict]:
+    """
+    Same as get_proctor_keystrokes(), aggregated across every proctoring
+    session this user has had for the given assessment — see
+    get_proctor_summary_by_user_assessment() for why this exists.
+    """
+    if not assessment_id:
+        return []
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+            SELECT keys_json, captured_at
+            FROM quiz_proctor_keystrokes
+            WHERE user_id = %s AND assessment_id = %s
+            ORDER BY captured_at ASC
+            LIMIT %s
+            """,
+            (user_id, assessment_id, limit),
+        )
+        rows = cursor.fetchall() or []
+    finally:
+        cursor.close()
+        conn.close()
+
+    return _decode_keystroke_rows(rows)
+
+
+def _decode_keystroke_rows(rows: list[dict]) -> list[dict]:
+    """Flatten a list of {"keys_json", "captured_at"} batch rows into one
+    list of individual keystroke dicts, dropping any batch that fails to
+    decode rather than failing the whole review page."""
+    keystrokes = []
+    for row in rows:
+        try:
+            keystrokes.extend(json.loads(row["keys_json"]))
+        except Exception:
+            continue
+    return keystrokes
+
+
+_KEY_NAME_OVERRIDES = {" ": "Space"}
+
+
+def format_keystrokes_for_display(keystrokes: list[dict]) -> str:
+    """
+    Render a flat list of keystroke dicts (as returned by
+    get_proctor_keystrokes()/get_proctor_keystrokes_by_user_assessment()) as
+    one space-separated line of key names for instructor review, e.g.
+    "h e l l o Ctrl+c Ctrl+v Enter". Held modifiers are folded into a
+    "Mod+key" label rather than shown as separate keydown events, since the
+    modifier key's own keydown (e.g. "Control") is otherwise indistinguishable
+    noise next to the key it was held with.
+    """
+    parts = []
+    for entry in keystrokes:
+        key = entry.get("key", "")
+        if key in ("Control", "Shift", "Alt", "Meta"):
+            continue
+        label = _KEY_NAME_OVERRIDES.get(key, key)
+        mods = [
+            mod for mod, held in (
+                ("Ctrl", entry.get("ctrl")),
+                ("Alt", entry.get("alt")),
+                ("Meta", entry.get("meta")),
+                ("Shift", entry.get("shift")),
+            )
+            if held
+        ]
+        parts.append("+".join(mods + [label]) if mods else label)
+    return " ".join(parts)
+
+
+def delete_proctor_session(session_id: str) -> dict:
+    """
+    Permanently delete every event, frame (including its image file on
+    disk), and keystroke batch recorded under one proctoring session_id.
+
+    Lets an instructor discard the monitoring data for a single quiz
+    attempt from the review UI, as opposed to cleanup_old_proctor_data()'s
+    age-based bulk purge. The practice_quiz_attempts row that referenced
+    this session_id is left in place — the attempt itself isn't deleted,
+    only the monitoring data attached to it; get_proctor_summary() and
+    get_proctor_frames()/get_proctor_keystrokes() simply return empty
+    results for this session_id afterwards.
+
+    Returns {"events_deleted": int, "frames_deleted": int, "files_removed": int,
+    "keystrokes_deleted": int}.
+    """
+    if not session_id:
+        return {"events_deleted": 0, "frames_deleted": 0, "files_removed": 0, "keystrokes_deleted": 0}
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT file_path FROM quiz_proctor_frames WHERE session_id = %s",
+            (session_id,),
+        )
+        frames = cursor.fetchall() or []
+    finally:
+        cursor.close()
+
+    files_removed = 0
+    for row in frames:
+        try:
+            path = Path(row["file_path"])
+            if path.exists():
+                path.unlink()
+                files_removed += 1
+        except Exception:
+            pass
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM quiz_proctor_frames WHERE session_id = %s", (session_id,))
+        frames_deleted = cursor.rowcount
+
+        cursor.execute("DELETE FROM quiz_proctor_events WHERE session_id = %s", (session_id,))
+        events_deleted = cursor.rowcount
+
+        cursor.execute("DELETE FROM quiz_proctor_keystrokes WHERE session_id = %s", (session_id,))
+        keystrokes_deleted = cursor.rowcount
+
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {
+        "events_deleted": events_deleted,
+        "frames_deleted": frames_deleted,
+        "files_removed": files_removed,
+        "keystrokes_deleted": keystrokes_deleted,
+    }
+
+
+def delete_proctor_data_for_user_assessment(user_id: int, assessment_id) -> dict:
+    """
+    Permanently delete every event, frame (including its image file on
+    disk), and keystroke batch recorded for one student across every
+    proctoring session tied to one assessment.
+
+    Used by the Exam Grading "Submit My Exam" review, where individual
+    uploaded files aren't pinned to a single session_id in the first place
+    (see get_proctor_summary_by_user_assessment() for why — a student may
+    have re-opened the upload page, and so started a new monitoring
+    session, more than once before finally submitting). That means this is
+    the finest-grained delete available there: "this student's entire
+    proctoring history for this assessment," not a single attempt.
+
+    Returns {"events_deleted": int, "frames_deleted": int, "files_removed": int,
+    "keystrokes_deleted": int}.
+    """
+    if not assessment_id:
+        return {"events_deleted": 0, "frames_deleted": 0, "files_removed": 0, "keystrokes_deleted": 0}
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT file_path FROM quiz_proctor_frames WHERE user_id = %s AND assessment_id = %s",
+            (user_id, assessment_id),
+        )
+        frames = cursor.fetchall() or []
+    finally:
+        cursor.close()
+
+    files_removed = 0
+    for row in frames:
+        try:
+            path = Path(row["file_path"])
+            if path.exists():
+                path.unlink()
+                files_removed += 1
+        except Exception:
+            pass
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "DELETE FROM quiz_proctor_frames WHERE user_id = %s AND assessment_id = %s",
+            (user_id, assessment_id),
+        )
+        frames_deleted = cursor.rowcount
+
+        cursor.execute(
+            "DELETE FROM quiz_proctor_events WHERE user_id = %s AND assessment_id = %s",
+            (user_id, assessment_id),
+        )
+        events_deleted = cursor.rowcount
+
+        cursor.execute(
+            "DELETE FROM quiz_proctor_keystrokes WHERE user_id = %s AND assessment_id = %s",
+            (user_id, assessment_id),
+        )
+        keystrokes_deleted = cursor.rowcount
+
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {
+        "events_deleted": events_deleted,
+        "frames_deleted": frames_deleted,
+        "files_removed": files_removed,
+        "keystrokes_deleted": keystrokes_deleted,
+    }
+
+
 def cleanup_old_proctor_data(retention_days: int = 7) -> dict:
     """
-    Permanently delete proctoring events and screen-capture frames older than
-    retention_days, removing each frame's image file from disk before its
-    quiz_proctor_frames row is deleted.
+    Permanently delete proctoring events, screen-capture frames, and
+    keystroke batches older than retention_days, removing each frame's image
+    file from disk before its quiz_proctor_frames row is deleted.
 
     This data is meant to be short-lived (see module docstring) — anything
     still within the retention window is left untouched; everything older is
@@ -403,9 +736,10 @@ def cleanup_old_proctor_data(retention_days: int = 7) -> dict:
     external scheduler calling this function directly; nothing in this app
     calls it automatically.
 
-    Returns {"events_deleted": int, "frames_deleted": int, "files_removed": int}.
-    files_removed may be lower than frames_deleted if some files were already
-    missing from disk (e.g. removed manually) — that is not an error here.
+    Returns {"events_deleted": int, "frames_deleted": int, "files_removed": int,
+    "keystrokes_deleted": int}. files_removed may be lower than frames_deleted
+    if some files were already missing from disk (e.g. removed manually) —
+    that is not an error here.
     """
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -443,6 +777,12 @@ def cleanup_old_proctor_data(retention_days: int = 7) -> dict:
         )
         events_deleted = cursor.rowcount
 
+        cursor.execute(
+            "DELETE FROM quiz_proctor_keystrokes WHERE captured_at < (NOW() - INTERVAL %s DAY)",
+            (retention_days,),
+        )
+        keystrokes_deleted = cursor.rowcount
+
         conn.commit()
     finally:
         cursor.close()
@@ -452,6 +792,7 @@ def cleanup_old_proctor_data(retention_days: int = 7) -> dict:
         "events_deleted": events_deleted,
         "frames_deleted": frames_deleted,
         "files_removed": files_removed,
+        "keystrokes_deleted": keystrokes_deleted,
     }
 
 
@@ -476,11 +817,12 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
 
     if share_key not in st.session_state:
         st.info(
-            "This quiz is monitored for academic integrity. Tab switches and "
-            "window focus changes are recorded automatically. You'll also be "
-            "asked to share your screen below — your browser will show its "
-            "own permission dialog for that. Once granted, periodic snapshots "
-            "of your screen are saved for instructor review."
+            "This quiz is monitored for academic integrity. Tab switches, "
+            "window focus changes, and keys you press on this page are "
+            "recorded automatically. You'll also be asked to share your "
+            "screen below — your browser will show its own permission "
+            "dialog for that. Once granted, periodic snapshots of your "
+            "screen are saved for instructor review."
         )
 
     # Mounted on every rerun, not just before the permission outcome is known
@@ -520,12 +862,26 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
                 "— this has been recorded for instructor review."
             )
 
+    # ---- Always-on keystroke logger ----
+    # Mounted on every rerun, same as the tab monitor — it must stay mounted
+    # to keep receiving periodic "keystrokes" batches for as long as the quiz
+    # page is open.
+    keystroke_result = _keystroke_monitor(
+        key=f"proctor_keystrokes_{session_id}",
+        on_keystrokes_change=lambda: None,
+    )
+    if keystroke_result.keystrokes is not None:
+        save_proctor_keystrokes(
+            session_id, user_id, quiz_id, assessment_id,
+            keystroke_result.keystrokes.get("keys", []),
+        )
+
     if st.session_state[count_key]:
         st.caption(
             f"🔴 Monitoring active — {st.session_state[count_key]} "
             "tab-switch/focus warning(s) recorded this session."
         )
     else:
-        st.caption("🟢 Monitoring active — tab switches and focus loss are being recorded.")
+        st.caption("🟢 Monitoring active — tab switches, focus loss, and keystrokes are being recorded.")
 
     return session_id

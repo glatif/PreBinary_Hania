@@ -753,3 +753,31 @@ CREATE TABLE quiz_proctor_frames (
     FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
     INDEX idx_proctor_frame_session (session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 23. QUIZ PROCTOR KEYSTROKES
+-- =============================================================================
+-- Keys pressed while a student has a proctored quiz/exam-submission page
+-- open, captured client-side by proctoring_feature.py. Keystrokes are
+-- buffered in the browser and flushed in batches (see
+-- KEYSTROKE_FLUSH_INTERVAL_MS in proctoring_feature.py) rather than sent one
+-- row per keypress, to avoid a full app rerun on every key. keys_json holds
+-- one JSON array of {"key": ..., "t": ...} objects per batch, using the same
+-- session_id/user_id/quiz_id/assessment_id linkage as quiz_proctor_events
+-- and quiz_proctor_frames so instructors can review all three together.
+
+CREATE TABLE quiz_proctor_keystrokes (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    session_id    VARCHAR(36)  NOT NULL,
+    user_id       INT          NOT NULL,
+    quiz_id       INT          NULL,
+    assessment_id INT          NULL,
+    keys_json     LONGTEXT     NOT NULL,
+    captured_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_keystroke_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
