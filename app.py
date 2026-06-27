@@ -2061,21 +2061,28 @@ def admin_panel_page():
     """
     Standalone Admin Panel page, accessible only to admin-role users.
 
-    Organised into two tabs:
-      Users   — create, edit, reset password, and delete user accounts.
-      Courses — create, edit, duplicate, delete all courses in the database,
-                and drill into a course to edit or delete its assessments.
+    Organised into four tabs:
+      Users           — create, edit, reset password, and delete user accounts.
+      Courses         — create, edit, duplicate, delete all courses in the database,
+                         and drill into a course to edit or delete its assessments.
+      Verification Log — read-only audit trail of identity-verification attempts
+                         (exam_verification feature).
     """
     st.title("Admin Panel")
     engine = get_engine()
 
-    tab_users, tab_courses, tab_maintenance = st.tabs(["Users", "Courses", "Maintenance"])
+    tab_users, tab_courses, tab_verification, tab_maintenance = st.tabs(
+        ["Users", "Courses", "Verification Log", "Maintenance"]
+    )
 
     with tab_users:
         _admin_users_tab(engine)
 
     with tab_courses:
         _admin_courses_panel(engine)
+
+    with tab_verification:
+        _admin_verification_log_tab(engine)
 
     with tab_maintenance:
         _admin_maintenance_tab()
@@ -2093,22 +2100,92 @@ def admin_page():
     render_dashboard()
 
 
+def _admin_verification_log_tab(engine):
+    """
+    Admin Panel → Verification Log tab.
+
+    Read-only audit trail of every identity-verification attempt (one row
+    per attempt, pass or fail) written by verify_student_identity() in
+    exam_verification_feature.py. Joined against users so each row shows
+    which account attempted verification, which document type was detected
+    (institution student card, BC driver's licence, BC Services Card/BCID,
+    or other Canadian government ID), the name/roll number read off it,
+    its expiry status, and whether the face match succeeded.
+    """
+    st.subheader("Identity Verification Attempts")
+    st.caption(
+        "Every time a student goes through the ID document + selfie "
+        "verification gate, the result is logged here — regardless of "
+        "whether it passed."
+    )
+
+    df = pd.read_sql(
+        text("""
+            SELECT
+                va.id, va.user_id, u.username, va.gate_key, va.document_type,
+                va.expected_name, va.expected_roll_no, va.ocr_text,
+                va.name_matched, va.roll_matched, va.expiry_date, va.expired,
+                va.face_matched, va.face_distance, va.face_threshold,
+                va.face_error, va.passed, va.created_at
+            FROM verification_attempts va
+            LEFT JOIN users u ON u.id = va.user_id
+            ORDER BY va.created_at DESC
+        """),
+        engine,
+    )
+
+    if df.empty:
+        st.info("No verification attempts have been recorded yet.")
+        return
+
+    document_type_labels = {
+        "student_card": "Institution Student ID Card",
+        "bc_drivers_licence": "BC Driver's Licence",
+        "bc_services_card_or_bcid": "BC Services Card / BCID",
+        "other_gov_id": "Other Canadian Government ID",
+    }
+    display_df = df.drop(columns=["user_id"]).copy()
+    display_df["document_type"] = display_df["document_type"].map(document_type_labels).fillna(display_df["document_type"])
+    display_df = display_df.rename(columns={
+        "id": "ID",
+        "username": "Account",
+        "gate_key": "Gate",
+        "document_type": "Document Type",
+        "expected_name": "Name on File",
+        "expected_roll_no": "Roll/T-ID on File",
+        "ocr_text": "Text Read From Document",
+        "name_matched": "Name Matched",
+        "roll_matched": "Roll/T-ID Matched",
+        "expiry_date": "Expiry Date",
+        "expired": "Expired",
+        "face_matched": "Face Matched",
+        "face_distance": "Face Distance",
+        "face_threshold": "Face Threshold",
+        "face_error": "Face Error",
+        "passed": "Passed",
+        "created_at": "When",
+    })
+    st.dataframe(display_df, hide_index=True, width="stretch")
+
+
 def _admin_maintenance_tab():
     """
     Admin Panel → Maintenance tab.
 
     Currently holds a single on-demand action: purge proctoring data (tab-
-    switch/focus-loss events, screen-capture frame files, and keystroke logs)
-    older than a chosen retention window. This app has no background worker
-    or cron, so nothing deletes this data unless an admin clicks the button
-    here — see cleanup_old_proctor_data() in proctoring_feature.py for what
-    it does and why this data is treated as short-lived in the first place.
+    switch/focus-loss events, screen-capture frame files, webcam frame files,
+    and keystroke logs) older than a chosen retention window. This app has no
+    background worker or cron, so nothing deletes this data unless an admin
+    clicks the button here — see cleanup_old_proctor_data() in
+    proctoring_feature.py for what it does and why this data is treated as
+    short-lived in the first place.
     """
     st.subheader("Proctoring Data Cleanup")
     st.write(
-        "Tab-switch/focus-loss events, screen-capture frames, and keystroke "
-        "logs recorded during proctored quizzes and exam submissions. "
-        "Deleting them also removes the captured frame images from disk."
+        "Tab-switch/focus-loss events, screen-capture frames, webcam frames "
+        "(with their face/gaze analysis), and keystroke logs recorded during "
+        "proctored quizzes and exam submissions. Deleting them also removes "
+        "the captured frame images from disk."
     )
     retention_days = st.number_input(
         "Delete proctoring data older than (days)",
@@ -2120,7 +2197,8 @@ def _admin_maintenance_tab():
             result = cleanup_old_proctor_data(retention_days=int(retention_days))
         st.success(
             f"Deleted {result['events_deleted']} event(s), "
-            f"{result['frames_deleted']} frame record(s), "
+            f"{result['frames_deleted']} screen frame record(s), "
+            f"{result['webcam_frames_deleted']} webcam frame record(s), "
             f"{result['keystrokes_deleted']} keystroke batch(es), and removed "
             f"{result['files_removed']} image file(s) from disk."
         )

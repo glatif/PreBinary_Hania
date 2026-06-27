@@ -27,6 +27,8 @@
 --   wellness_chat_history Per-user Wellness Assistant conversation turns.
 --   practice_quiz_generated  Self-service generated practice quizzes per user.
 --   practice_quiz_attempts   Student attempts against a generated practice quiz.
+--   verification_attempts    Audit log of identity-verification attempts
+--                             (exam_verification feature).
 --
 -- All tables use InnoDB for foreign key support and utf8mb4 for full Unicode.
 --
@@ -780,4 +782,94 @@ CREATE TABLE quiz_proctor_keystrokes (
     FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
     FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
     INDEX idx_proctor_keystroke_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 24. QUIZ PROCTOR WEBCAM FRAMES
+-- =============================================================================
+-- Periodic webcam snapshots, captured client-side by proctoring_feature.py
+-- once a student grants camera permission, alongside the same session_id/
+-- user_id/quiz_id/assessment_id linkage as quiz_proctor_events/_frames/
+-- _keystrokes. Parallel to quiz_proctor_frames (screen-share snapshots) but
+-- with each frame additionally run through a face/gaze analysis pass:
+-- face_count/no_face/multiple_faces come from mediapipe FaceMesh detection;
+-- looking_away/yaw_deg/pitch_deg come from a solvePnP head-pose estimate
+-- over that frame's facial landmarks, and are NULL whenever face_count != 1
+-- (head pose can't be estimated with zero or more than one face in frame).
+--
+-- Like quiz_proctor_frames, this is NOT continuous video — frames are
+-- captured at a fixed interval (see CAMERA_CAPTURE_INTERVAL_MS in
+-- proctoring_feature.py). Deleting a row here does not delete the file on
+-- disk; only the DB record cascades away with the user/quiz/assessment it
+-- references. Image files live under uploads/proctor_webcam_frames/.
+
+CREATE TABLE quiz_proctor_webcam_frames (
+    id             INT AUTO_INCREMENT PRIMARY KEY,
+    session_id     VARCHAR(36)  NOT NULL,
+    user_id        INT          NOT NULL,
+    quiz_id        INT          NULL,
+    assessment_id  INT          NULL,
+    file_path      VARCHAR(500) NOT NULL,
+    face_count     INT          NOT NULL,
+    no_face        TINYINT(1)   NOT NULL,
+    multiple_faces TINYINT(1)   NOT NULL,
+    looking_away   TINYINT(1)   NULL,
+    yaw_deg        FLOAT        NULL,
+    pitch_deg      FLOAT        NULL,
+    captured_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_webcam_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 25. VERIFICATION ATTEMPTS
+-- =============================================================================
+-- Audit log of every identity-verification attempt made through the
+-- exam_verification feature (verify_student_identity() in
+-- exam_verification_feature.py), one row per attempt regardless of outcome.
+--
+-- document_type is auto-detected by detect_document_type() from keywords in
+-- the OCR text: student_card (institution ID — the only type a roll number
+-- check applies to), bc_drivers_licence, bc_services_card_or_bcid, or the
+-- generic other_gov_id (passport, other provinces' licences, ...).
+--
+-- expected_name / expected_roll_no are a snapshot of the student's profile
+-- fields (users.first_name/last_name/roll_no) at the time of the attempt, so
+-- the row stays meaningful even if the profile changes later. ocr_text is
+-- the raw text EasyOCR read off the ID document photo; name_matched/
+-- roll_matched record whether the expected name/roll number were found
+-- inside it (roll_matched is NULL when the document type isn't
+-- student_card, or the student has no roll_no on file, and the check was
+-- skipped). expiry_date/expired come from check_expiry() — both NULL when
+-- the document type carries no expiry (student_card) or no date could be
+-- read off it. face_matched/face_distance/face_threshold/face_error mirror
+-- the dict returned by check_face_match(). passed is the overall gate
+-- verdict (name_matched AND roll check AND NOT expired AND face_matched).
+
+CREATE TABLE verification_attempts (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    user_id         INT          NOT NULL,
+    gate_key        VARCHAR(100) NOT NULL,
+    document_type   VARCHAR(40)  NOT NULL DEFAULT 'student_card',
+    expected_name   VARCHAR(101) NOT NULL,
+    expected_roll_no VARCHAR(50) NULL,
+    ocr_text        LONGTEXT     NULL,
+    name_matched    TINYINT(1)   NOT NULL,
+    roll_matched    TINYINT(1)   NULL,
+    expiry_date     DATE         NULL,
+    expired         TINYINT(1)   NULL,
+    face_matched    TINYINT(1)   NOT NULL,
+    face_distance   FLOAT        NULL,
+    face_threshold  FLOAT        NULL,
+    face_error      VARCHAR(255) NULL,
+    passed          TINYINT(1)   NOT NULL,
+    created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_verification_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
