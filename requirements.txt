@@ -117,6 +117,25 @@ easyocr
 opencv-python-headless
 
 
+# ── Exam Proctoring — webcam face/gaze monitoring ────────────────────────────
+# mediapipe's FaceMesh model (proctoring_feature.py) detects no-face/
+# multiple-faces and estimates head pose for the "looking away from screen"
+# check on periodic webcam snapshots. Pinned to 0.10.9, the last release with
+# a numpy<2 compatible wheel — newer mediapipe pulls numpy>=2, which breaks
+# sentence-transformers (numpy<2, pinned below). Installed with --no-deps for
+# its bundled opencv-contrib-python dependency specifically: that package
+# installs into the same cv2/ namespace as opencv-python-headless above, and
+# FaceMesh.process() doesn't need it for this app's use (no
+# mp.solutions.drawing_utils calls) — keeping only opencv-python-headless
+# avoids two packages fighting over the same site-packages/cv2/ directory.
+# protobuf is downgraded to 3.20.3 to satisfy mediapipe's protobuf<4
+# requirement; nothing else installed here hard-requires protobuf>=4.
+mediapipe==0.10.9
+protobuf<4,>=3.11
+matplotlib
+sounddevice
+
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 numpy<2.0.0
 pyarrow==14.0.1

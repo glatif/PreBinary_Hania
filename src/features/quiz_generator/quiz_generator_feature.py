@@ -65,6 +65,8 @@ from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
     get_proctor_summary,
     get_proctor_frames,
+    get_proctor_webcam_summary,
+    get_proctor_webcam_frames,
     get_proctor_keystrokes,
     format_keystrokes_for_display,
     delete_proctor_session,
@@ -1337,6 +1339,45 @@ def render_instructor_attempts_tab(assessment_id: int) -> None:
                         with frame_cols[i % 4]:
                             st.image(frame["file_path"], caption=str(frame["captured_at"]))
 
+            # Webcam snapshots captured while the student had the quiz open,
+            # plus the face/gaze analysis run on each one — see
+            # analyze_webcam_frame() in proctoring_feature.py.
+            webcam_proctor = get_proctor_webcam_summary(attempt.get("proctor_session_id"))
+            webcam_label = {
+                "granted": "✅ granted",
+                "denied":  "❌ denied",
+                None:      "— not recorded",
+            }[webcam_proctor["webcam"]]
+            suspicious_count = (
+                webcam_proctor["no_face_count"]
+                + webcam_proctor["multiple_faces_count"]
+                + webcam_proctor["looking_away_count"]
+            )
+            suspicious_icon = "🔴" if suspicious_count else "🟢"
+            st.write(
+                f"**Camera:** {suspicious_icon} {webcam_label} — "
+                f"{webcam_proctor['no_face_count']} no-face, "
+                f"{webcam_proctor['multiple_faces_count']} multiple-faces, "
+                f"{webcam_proctor['looking_away_count']} looking-away frame(s)"
+            )
+            webcam_frames = get_proctor_webcam_frames(attempt.get("proctor_session_id"))
+            if webcam_frames:
+                with st.expander(f"📷 Webcam Capture Frames ({len(webcam_frames)})", expanded=False):
+                    webcam_cols = st.columns(4)
+                    for i, frame in enumerate(webcam_frames):
+                        flags = []
+                        if frame["no_face"]:
+                            flags.append("no face")
+                        if frame["multiple_faces"]:
+                            flags.append(f"{frame['face_count']} faces")
+                        if frame["looking_away"]:
+                            flags.append("looking away")
+                        caption = str(frame["captured_at"])
+                        if flags:
+                            caption += " — ⚠️ " + ", ".join(flags)
+                        with webcam_cols[i % 4]:
+                            st.image(frame["file_path"], caption=caption)
+
             # Keys pressed while the student had the quiz open, flushed in
             # batches every KEYSTROKE_FLUSH_INTERVAL_MS — see
             # proctoring_feature.py. Not shown at all if none were recorded.
@@ -1523,14 +1564,15 @@ def _dialog_delete_quiz_attempt(attempt_id: int) -> None:
 def _dialog_delete_proctor_session(session_id: str) -> None:
     """
     Confirmation modal for an instructor permanently deleting the tab-switch
-    events, screen-capture frames, and keystroke logs tied to one quiz
-    attempt's proctoring session — the attempt and its score are unaffected.
+    events, screen-capture frames, webcam frames, and keystroke logs tied to
+    one quiz attempt's proctoring session — the attempt and its score are
+    unaffected.
     """
     st.warning(
         "Are you sure you want to delete the tab-switch/focus events, "
-        "screen-capture frames, and keystroke logs recorded for this "
-        "attempt? The attempt and its score are not affected. This cannot "
-        "be undone."
+        "screen-capture frames, webcam frames, and keystroke logs recorded "
+        "for this attempt? The attempt and its score are not affected. "
+        "This cannot be undone."
     )
     col1, col2 = st.columns(2)
     if col1.button("Delete", type="primary", key="proctor_dialog_confirm_delete"):
