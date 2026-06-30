@@ -109,13 +109,29 @@ MAX_CAMERA_FRAME_DIMENSION_PX = 480      # smaller than screen frames — just n
 CAMERA_JPEG_QUALITY            = 0.6
 MAX_CAMERA_FRAMES_PER_SESSION  = 120     # hard cap (~40 minutes at the interval above)
 
-# ---- "Looking away" head-pose thresholds — tune to taste ----
-# A face turned/tilted further than these angles (degrees) from facing the
-# camera straight-on is flagged as looking away. Generous on purpose: webcams
-# are usually off to one side of the screen, so some natural yaw/pitch while
-# reading the screen is expected.
-LOOKING_AWAY_YAW_THRESHOLD_DEG   = 30
-LOOKING_AWAY_PITCH_THRESHOLD_DEG = 25
+# ---- "Looking away" thresholds — tune to taste ----
+# Two independent signals feed looking_away (see analyze_webcam_frame()):
+#
+# Head pose (yaw/pitch, degrees) from solvePnP against an uncalibrated,
+# approximate camera matrix (focal_length = image width — there is no real
+# per-device calibration available). That approximation systematically
+# *underestimates* real rotation: in testing, a face turned/tilted enough to
+# clearly be looking at a phone in the lap for 15+ seconds only produced
+# ~8-10 degrees of estimated yaw/pitch — well under a 30/25 threshold, which
+# is why it originally failed to flag anything. Thresholds below are lowered
+# accordingly, but treat this signal as a coarse secondary check, not a
+# precise angle.
+#
+# Gaze offset (see _estimate_gaze_offset()) measures how far the iris has
+# drifted from the center of the eye socket, as a ratio of eye width/height.
+# This is scale- and calibration-free (a ratio within the same eye, not an
+# absolute angle), so it doesn't share the head-pose signal's underestimation
+# problem, and it also catches glances where the head barely moves but the
+# eyes do — the primary signal; head pose is the fallback for cases where iris
+# landmarks are unreliable (glasses glare, partial occlusion).
+LOOKING_AWAY_YAW_THRESHOLD_DEG   = 18
+LOOKING_AWAY_PITCH_THRESHOLD_DEG = 15
+GAZE_OFFSET_THRESHOLD            = 0.20
 
 _PROCTOR_FRAMES_DIR        = Path("uploads") / "proctor_frames"
 _PROCTOR_WEBCAM_FRAMES_DIR = Path("uploads") / "proctor_webcam_frames"
@@ -465,12 +481,13 @@ def save_proctor_frame(
 @st.cache_resource(show_spinner=False)
 def _get_face_mesh():
     """Build (once per process) the mediapipe FaceMesh detector used to find
-    faces and facial landmarks in webcam frames."""
+    faces and facial landmarks in webcam frames. refine_landmarks=True adds
+    the iris landmarks (indices 468-477) used by _estimate_gaze_offset()."""
     import mediapipe as mp
     return mp.solutions.face_mesh.FaceMesh(
         static_image_mode=True,
         max_num_faces=3,
-        refine_landmarks=False,
+        refine_landmarks=True,
         min_detection_confidence=0.5,
     )
 
@@ -493,12 +510,21 @@ _HEAD_POSE_MODEL_POINTS_3D = [
 ]
 
 
+# solvePnP occasionally converges to a flipped/degenerate solution (observed
+# in testing: yaw values around 167-175 degrees, which is not a physically
+# plausible pose for a face FaceMesh still detected as front-facing) — a
+# known failure mode of 6-point PnP when the landmarks are slightly noisy or
+# nearly coplanar. Angles beyond this are treated as a failed estimate.
+_HEAD_POSE_MAX_PLAUSIBLE_DEG = 90
+
+
 def _estimate_head_pose(landmarks, image_w: int, image_h: int):
     """
     Estimate (yaw_deg, pitch_deg) from one face's FaceMesh landmarks via
     solvePnP against a generic 3D face model, using image dimensions to
     build an approximate camera matrix (no real camera calibration
-    available). Returns (None, None) if solvePnP fails to converge.
+    available). Returns (None, None) if solvePnP fails to converge, or if it
+    converges to an implausible angle (see _HEAD_POSE_MAX_PLAUSIBLE_DEG).
     """
     import cv2
     import numpy as np
@@ -535,18 +561,87 @@ def _estimate_head_pose(landmarks, image_w: int, image_h: int):
     sy = (rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2) ** 0.5
     pitch = np.degrees(np.arctan2(-rotation_matrix[2, 0], sy))
     yaw   = np.degrees(np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]))
+
+    if abs(yaw) > _HEAD_POSE_MAX_PLAUSIBLE_DEG or abs(pitch) > _HEAD_POSE_MAX_PLAUSIBLE_DEG:
+        return None, None
+
     return float(yaw), float(pitch)
+
+
+# Eye-corner / eyelid / iris-center landmark indices from mediapipe's
+# refine_landmarks=True FaceMesh output, used by _estimate_gaze_offset() to
+# measure how far each iris has drifted from the center of its eye socket.
+_LEFT_EYE_H_CORNERS  = (33, 133)    # outer, inner corner
+_LEFT_EYE_V_LIDS     = (159, 145)   # upper, lower lid
+_LEFT_IRIS_CENTER    = 468
+_RIGHT_EYE_H_CORNERS = (362, 263)   # inner, outer corner
+_RIGHT_EYE_V_LIDS    = (386, 374)   # upper, lower lid
+_RIGHT_IRIS_CENTER   = 473
+
+
+# Minimum eye width/height (as a fraction of the whole image — these are
+# normalized 0-1 FaceMesh coordinates) below which _eye_offset_ratio()
+# refuses to compute a ratio. Without this, a near-closed eye (a blink
+# caught mid-frame, or just landmark noise on a small/blurry crop) makes the
+# denominator tiny and the resulting ratio explode to nonsense values —
+# observed in testing as gaze_offset_y readings of -1 to -6 (the valid range
+# is roughly +/-0.5) on otherwise unremarkable frames.
+_MIN_EYE_DIMENSION = 0.008
+
+
+def _eye_offset_ratio(landmarks, h_corners, v_lids, iris_center):
+    """
+    Return (horizontal_ratio, vertical_ratio) describing how far one eye's
+    iris has drifted from that eye's center, as a fraction of its own
+    width/height — 0.0 means centered, roughly +/-0.5 means at the eye's
+    edge. Being a ratio within the same eye rather than an absolute angle,
+    this needs no camera calibration and stays comparable across different
+    webcams/distances, unlike _estimate_head_pose(). Returns (0.0, 0.0) —
+    treated as centered/inconclusive rather than a measurement — if the eye
+    is too small in frame to divide by reliably (see _MIN_EYE_DIMENSION).
+    """
+    left, right = landmarks[h_corners[0]], landmarks[h_corners[1]]
+    top, bottom = landmarks[v_lids[0]], landmarks[v_lids[1]]
+    iris = landmarks[iris_center]
+
+    eye_width = right.x - left.x
+    eye_height = bottom.y - top.y
+    h_ratio = (
+        (iris.x - min(left.x, right.x)) / abs(eye_width) - 0.5
+        if abs(eye_width) >= _MIN_EYE_DIMENSION else 0.0
+    )
+    v_ratio = (
+        (iris.y - min(top.y, bottom.y)) / abs(eye_height) - 0.5
+        if abs(eye_height) >= _MIN_EYE_DIMENSION else 0.0
+    )
+    return h_ratio, v_ratio
+
+
+def _estimate_gaze_offset(landmarks):
+    """Average the horizontal/vertical iris-offset ratio (see
+    _eye_offset_ratio()) across both eyes."""
+    lh, lv = _eye_offset_ratio(landmarks, _LEFT_EYE_H_CORNERS, _LEFT_EYE_V_LIDS, _LEFT_IRIS_CENTER)
+    rh, rv = _eye_offset_ratio(landmarks, _RIGHT_EYE_H_CORNERS, _RIGHT_EYE_V_LIDS, _RIGHT_IRIS_CENTER)
+    return (lh + rh) / 2, (lv + rv) / 2
 
 
 def analyze_webcam_frame(image_bytes: bytes) -> dict:
     """
     Run one webcam JPEG frame through face detection and (when exactly one
-    face is found) head-pose estimation.
+    face is found) head-pose estimation plus iris-offset gaze estimation.
+
+    looking_away is flagged if *either* signal crosses its threshold: a head
+    pose beyond LOOKING_AWAY_YAW/PITCH_THRESHOLD_DEG, or an iris-offset ratio
+    beyond GAZE_OFFSET_THRESHOLD in either eye (see module constants above
+    for why both exist — head pose alone undershoots real rotation, and gaze
+    offset alone can miss a full head turn if the face detector loses the
+    iris landmarks).
 
     Returns {"face_count": int, "no_face": bool, "multiple_faces": bool,
-    "looking_away": bool|None, "yaw_deg": float|None, "pitch_deg": float|None}.
-    looking_away/yaw_deg/pitch_deg stay None whenever face_count != 1 — head
-    pose is meaningless with zero or multiple faces in frame.
+    "looking_away": bool|None, "yaw_deg": float|None, "pitch_deg": float|None,
+    "gaze_offset_x": float|None, "gaze_offset_y": float|None}. All of the
+    per-face fields stay None whenever face_count != 1 — they're meaningless
+    with zero or multiple faces in frame.
     """
     import cv2
     import numpy as np
@@ -557,6 +652,7 @@ def analyze_webcam_frame(image_bytes: bytes) -> dict:
         return {
             "face_count": 0, "no_face": True, "multiple_faces": False,
             "looking_away": None, "yaw_deg": None, "pitch_deg": None,
+            "gaze_offset_x": None, "gaze_offset_y": None,
         }
 
     face_mesh = _get_face_mesh()
@@ -564,15 +660,22 @@ def analyze_webcam_frame(image_bytes: bytes) -> dict:
     faces = results.multi_face_landmarks or []
     face_count = len(faces)
 
-    yaw = pitch = looking_away = None
+    yaw = pitch = gaze_x = gaze_y = looking_away = None
     if face_count == 1:
         h, w, _ = image_bgr.shape
-        yaw, pitch = _estimate_head_pose(faces[0].landmark, w, h)
-        if yaw is not None:
-            looking_away = (
-                abs(yaw) > LOOKING_AWAY_YAW_THRESHOLD_DEG
-                or abs(pitch) > LOOKING_AWAY_PITCH_THRESHOLD_DEG
-            )
+        landmarks = faces[0].landmark
+        yaw, pitch = _estimate_head_pose(landmarks, w, h)
+        gaze_x, gaze_y = _estimate_gaze_offset(landmarks)
+
+        head_turned = yaw is not None and (
+            abs(yaw) > LOOKING_AWAY_YAW_THRESHOLD_DEG
+            or abs(pitch) > LOOKING_AWAY_PITCH_THRESHOLD_DEG
+        )
+        eyes_off_center = (
+            abs(gaze_x) > GAZE_OFFSET_THRESHOLD
+            or abs(gaze_y) > GAZE_OFFSET_THRESHOLD
+        )
+        looking_away = head_turned or eyes_off_center
 
     return {
         "face_count": face_count,
@@ -581,6 +684,8 @@ def analyze_webcam_frame(image_bytes: bytes) -> dict:
         "looking_away": looking_away,
         "yaw_deg": yaw,
         "pitch_deg": pitch,
+        "gaze_offset_x": gaze_x,
+        "gaze_offset_y": gaze_y,
     }
 
 
@@ -626,13 +731,14 @@ def save_proctor_webcam_frame(
             INSERT INTO quiz_proctor_webcam_frames
                 (session_id, user_id, quiz_id, assessment_id, file_path,
                  face_count, no_face, multiple_faces, looking_away,
-                 yaw_deg, pitch_deg)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 yaw_deg, pitch_deg, gaze_offset_x, gaze_offset_y)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 session_id, user_id, quiz_id, assessment_id, str(file_path),
                 analysis["face_count"], analysis["no_face"], analysis["multiple_faces"],
                 analysis["looking_away"], analysis["yaw_deg"], analysis["pitch_deg"],
+                analysis["gaze_offset_x"], analysis["gaze_offset_y"],
             ),
         )
         conn.commit()
@@ -899,7 +1005,8 @@ def get_proctor_webcam_frames(session_id: str, limit: int = 200) -> list[dict]:
         cursor.execute(
             """
             SELECT file_path, face_count, no_face, multiple_faces,
-                   looking_away, yaw_deg, pitch_deg, captured_at
+                   looking_away, yaw_deg, pitch_deg, gaze_offset_x,
+                   gaze_offset_y, captured_at
             FROM quiz_proctor_webcam_frames
             WHERE session_id = %s
             ORDER BY captured_at DESC
@@ -926,7 +1033,8 @@ def get_proctor_webcam_frames_by_user_assessment(user_id: int, assessment_id, li
         cursor.execute(
             """
             SELECT file_path, face_count, no_face, multiple_faces,
-                   looking_away, yaw_deg, pitch_deg, captured_at
+                   looking_away, yaw_deg, pitch_deg, gaze_offset_x,
+                   gaze_offset_y, captured_at
             FROM quiz_proctor_webcam_frames
             WHERE user_id = %s AND assessment_id = %s
             ORDER BY captured_at DESC

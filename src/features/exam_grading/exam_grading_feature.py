@@ -35,7 +35,7 @@ import zipfile
 import tempfile
 from typing import List, Dict, Any
 from db import get_connection
-from auth import save_uploaded_file
+from auth import save_uploaded_file, delete_physical_file
 
 from src.utils.llm_utils import MODELS, generate_llm_response, MODEL_PROVIDERS, strip_llm_json
 from src.utils.pdf_utils import extract_text_from_pdf, save_uploaded_pdf
@@ -919,6 +919,38 @@ def _dialog_delete_proctor_data(user_id: int, assessment_id: int) -> None:
         st.rerun()
 
 
+@st.dialog("Delete Submitted File")
+def _dialog_delete_exam_submission_file(file_id: int, file_name: str, file_path: str, student_name: str) -> None:
+    """
+    Confirmation modal for an admin/teacher permanently deleting a single
+    file a student submitted through "Submit My Exam".
+
+    Removes both the files table row and the file on disk. Does not touch
+    that student's proctoring data (see _dialog_delete_proctor_data) or any
+    grading results already produced from this file — if it was already
+    loaded into the grading queue and graded, that result is unaffected.
+    """
+    st.warning(
+        f"Are you sure you want to delete **{file_name}** submitted by "
+        f"**{student_name}**? This cannot be undone."
+    )
+    col1, col2 = st.columns(2)
+    if col1.button("Delete", type="primary", key="eg_submission_dialog_confirm_delete"):
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM files WHERE id = %s", (file_id,))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+        delete_physical_file(file_path)
+        st.toast("Submitted file deleted.")
+        st.rerun()
+    if col2.button("Cancel", key="eg_submission_dialog_cancel_delete"):
+        st.rerun()
+
+
 def exam_grading_ui() -> None:
     """
     Render the full Exam Grading feature UI.
@@ -1269,7 +1301,17 @@ def exam_grading_ui() -> None:
                     for row in student_files:
                         name = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip() or "Unknown"
                         roll_suffix = f" (Roll No: {row['roll_no']})" if row.get("roll_no") else ""
-                        st.write(f"**{name}**{roll_suffix} — `{row['file_name']}`")
+                        file_col, file_del_col = st.columns([5, 1])
+                        with file_col:
+                            st.write(f"**{name}**{roll_suffix} — `{row['file_name']}`")
+                        with file_del_col:
+                            if st.session_state["user"].get("role") in ("admin", "teacher") and st.button(
+                                "🗑️ Delete file",
+                                key=f"eg_del_submission_{row['id']}",
+                            ):
+                                _dialog_delete_exam_submission_file(
+                                    row["id"], row["file_name"], row["file_path"], name,
+                                )
 
                         # Tab-switch/focus-loss and screen-share summary recorded
                         # between this student's identity verification and their
