@@ -793,10 +793,16 @@ CREATE TABLE quiz_proctor_keystrokes (
 -- user_id/quiz_id/assessment_id linkage as quiz_proctor_events/_frames/
 -- _keystrokes. Parallel to quiz_proctor_frames (screen-share snapshots) but
 -- with each frame additionally run through a face/gaze analysis pass:
--- face_count/no_face/multiple_faces come from mediapipe FaceMesh detection;
--- looking_away/yaw_deg/pitch_deg come from a solvePnP head-pose estimate
--- over that frame's facial landmarks, and are NULL whenever face_count != 1
--- (head pose can't be estimated with zero or more than one face in frame).
+-- face_count/no_face/multiple_faces come from mediapipe FaceMesh detection.
+-- looking_away is true if EITHER of two signals crosses its threshold (see
+-- analyze_webcam_frame() in proctoring_feature.py): yaw_deg/pitch_deg, a
+-- solvePnP head-pose estimate against an uncalibrated camera matrix (a
+-- coarse signal that underestimates real rotation), or gaze_offset_x/
+-- gaze_offset_y, a calibration-free ratio of how far the iris has drifted
+-- from the center of the eye socket (the primary signal — also catches
+-- glances where the head barely moves but the eyes do). All five are NULL
+-- whenever face_count != 1 (none of this is estimable with zero or more
+-- than one face in frame).
 --
 -- Like quiz_proctor_frames, this is NOT continuous video — frames are
 -- captured at a fixed interval (see CAMERA_CAPTURE_INTERVAL_MS in
@@ -817,6 +823,8 @@ CREATE TABLE quiz_proctor_webcam_frames (
     looking_away   TINYINT(1)   NULL,
     yaw_deg        FLOAT        NULL,
     pitch_deg      FLOAT        NULL,
+    gaze_offset_x  FLOAT        NULL,
+    gaze_offset_y  FLOAT        NULL,
     captured_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
