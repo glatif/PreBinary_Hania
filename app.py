@@ -2174,23 +2174,23 @@ def _admin_maintenance_tab():
 
     Currently holds a single on-demand action: purge proctoring data (tab-
     switch/focus-loss events, screen-capture frame files, webcam frame files,
-    and keystroke logs) older than a chosen retention window. This app has no
-    background worker or cron, so nothing deletes this data unless an admin
-    clicks the button here — see cleanup_old_proctor_data() in
-    proctoring_feature.py for what it does and why this data is treated as
-    short-lived in the first place.
+    keystroke logs, and mouse activity logs) older than a chosen retention
+    window. This app has no background worker or cron, so nothing deletes
+    this data unless an admin clicks the button here — see
+    cleanup_old_proctor_data() in proctoring_feature.py for what it does and
+    why this data is treated as short-lived in the first place.
     """
     st.subheader("Proctoring Data Cleanup")
     st.write(
         "Tab-switch/focus-loss events, screen-capture frames, webcam frames "
-        "(with their face/gaze analysis), and keystroke logs recorded during "
-        "proctored quizzes and exam submissions. Deleting them also removes "
-        "the captured frame images from disk."
+        "(with their face/gaze analysis), keystroke logs, and mouse activity "
+        "logs recorded during proctored quizzes and exam submissions. "
+        "Deleting them also removes the captured frame images from disk."
     )
     retention_days = st.number_input(
         "Delete proctoring data older than (days)",
         min_value=1, max_value=365, value=7,
-        help="Events, frames, and keystroke logs older than this many days will be permanently deleted.",
+        help="Events, frames, keystroke logs, and mouse activity logs older than this many days will be permanently deleted.",
     )
     if st.button("Run Proctoring Data Cleanup", type="primary"):
         with st.spinner("Cleaning up old proctoring data..."):
@@ -2199,8 +2199,9 @@ def _admin_maintenance_tab():
             f"Deleted {result['events_deleted']} event(s), "
             f"{result['frames_deleted']} screen frame record(s), "
             f"{result['webcam_frames_deleted']} webcam frame record(s), "
-            f"{result['keystrokes_deleted']} keystroke batch(es), and removed "
-            f"{result['files_removed']} image file(s) from disk."
+            f"{result['keystrokes_deleted']} keystroke batch(es), "
+            f"{result['mouse_events_deleted']} mouse-event batch(es), and "
+            f"removed {result['files_removed']} image file(s) from disk."
         )
 
 
