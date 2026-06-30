@@ -786,6 +786,35 @@ CREATE TABLE quiz_proctor_keystrokes (
 
 
 -- =============================================================================
+-- 23B. QUIZ PROCTOR MOUSE EVENTS
+-- =============================================================================
+-- Mouse activity captured the same way as quiz_proctor_keystrokes — buffered
+-- client-side and flushed in batches (see MOUSE_FLUSH_INTERVAL_MS in
+-- proctoring_feature.py) rather than one row per event. events_json holds
+-- one JSON array of {"type": "move"|"click"|"leave_window"|"enter_window",
+-- "x", "y", "button", "t"} objects per batch (x/y/button only present on
+-- "move"/"click" entries). Movement is sampled at most once every
+-- MOUSE_MOVE_SAMPLE_MS rather than logged on every native mousemove event,
+-- which fires far too often to record in full. Same session_id/user_id/
+-- quiz_id/assessment_id linkage as the other quiz_proctor_* tables.
+
+CREATE TABLE quiz_proctor_mouse_events (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    session_id    VARCHAR(36)  NOT NULL,
+    user_id       INT          NOT NULL,
+    quiz_id       INT          NULL,
+    assessment_id INT          NULL,
+    events_json   LONGTEXT     NOT NULL,
+    captured_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_mouse_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
 -- 24. QUIZ PROCTOR WEBCAM FRAMES
 -- =============================================================================
 -- Periodic webcam snapshots, captured client-side by proctoring_feature.py

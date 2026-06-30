@@ -1,8 +1,9 @@
 # =============================================================================
 # proctoring_feature.py
 # =============================================================================
-# Lightweight, always-on tab-switch / window-focus-loss monitoring and
-# keystroke logging, plus optional screen-share and webcam permission prompts
+# Lightweight, always-on tab-switch / window-focus-loss monitoring,
+# keystroke logging, and mouse-activity logging, plus optional screen-share
+# and webcam permission prompts
 # that — once granted — periodically capture a downscaled JPEG snapshot of
 # the shared screen / the student's face and save it to disk, for the active
 # quiz attempt that begins immediately after a student clears the identity
@@ -61,14 +62,21 @@
 # buffer when the tab is closed are lost — there is no reliable way to flush
 # a Streamlit component trigger value during page unload.
 #
+# Mouse activity follows the exact same buffered-batch pattern as keystrokes
+# (MOUSE_FLUSH_INTERVAL_MS / MAX_MOUSE_EVENTS_PER_BATCH), capturing clicks
+# one-for-one plus throttled movement samples (at most one every
+# MOUSE_MOVE_SAMPLE_MS — raw mousemove fires far too often to log every
+# event) and cursor leave/re-enter of the browser window.
+#
 # Implementation note: this uses st.components.v2.component(), which mounts
 # inline JS directly into the app's own DOM (no iframe), so document/window
 # in the JS below refer to the real top-level page.
 #
-# All events, frames, and keystroke batches are written to
+# All events, frames, and keystroke/mouse batches are written to
 # quiz_proctor_events / quiz_proctor_frames / quiz_proctor_webcam_frames /
-# quiz_proctor_keystrokes, keyed by a per-attempt session_id (a UUID minted
-# the first time the monitor renders for a given quiz gate). The same
+# quiz_proctor_keystrokes / quiz_proctor_mouse_events, keyed by a per-attempt
+# session_id (a UUID minted the first time the monitor renders for a given
+# quiz gate). The same
 # session_id is stamped onto the practice_quiz_attempts row at submission
 # time (quiz_generator_feature.py) so instructors can review the two
 # together. Frame image files are written to disk under
@@ -76,7 +84,8 @@
 # (webcam) — see save_proctor_frame()/save_proctor_webcam_frame().
 #
 # This data is meant to be short-lived: cleanup_old_proctor_data() deletes
-# events/frames/keystrokes (and frame files on disk) past a retention window,
+# events/frames/keystrokes/mouse-events (and frame files on disk) past a
+# retention window,
 # and is exposed as an on-demand "Run Proctoring Data Cleanup" button in the
 # Admin Panel's Maintenance tab (app.py) rather than running on its own — this
 # app has no background worker/cron, so nothing deletes data unless an admin
@@ -102,6 +111,15 @@ MAX_FRAMES_PER_SESSION = 120      # hard cap (~40 minutes at the interval above)
 # ---- Keystroke-batch cadence/limits — tune to taste ----
 KEYSTROKE_FLUSH_INTERVAL_MS = 15_000   # flush the buffered keys every 15 seconds
 MAX_KEYS_PER_BATCH          = 500      # flush early if the buffer hits this size
+
+# ---- Mouse-activity batch cadence/limits — tune to taste ----
+# Clicks are captured one-for-one, the same as keydowns above. Raw mousemove
+# fires far too often to log every event, so movement is sampled at most once
+# per MOUSE_MOVE_SAMPLE_MS — enough to reconstruct general activity level/
+# idle gaps without flooding the batch.
+MOUSE_FLUSH_INTERVAL_MS    = 15_000   # flush the buffered mouse events every 15 seconds
+MAX_MOUSE_EVENTS_PER_BATCH = 500      # flush early if the buffer hits this size
+MOUSE_MOVE_SAMPLE_MS       = 250      # minimum gap between recorded "move" samples
 
 # ---- Webcam-capture cadence/limits — tune to taste ----
 CAMERA_CAPTURE_INTERVAL_MS    = 20_000   # one frame every 20 seconds
@@ -191,6 +209,67 @@ export default function(component) {{
 
     return () => {{
         document.removeEventListener("keydown", onKeyDown);
+        clearInterval(intervalHandle);
+    }};
+}}
+"""
+
+_MOUSE_JS = f"""
+export default function(component) {{
+    const {{ setTriggerValue }} = component;
+
+    const FLUSH_INTERVAL_MS = {MOUSE_FLUSH_INTERVAL_MS};
+    const MAX_EVENTS_PER_BATCH = {MAX_MOUSE_EVENTS_PER_BATCH};
+    const MOVE_SAMPLE_MS = {MOUSE_MOVE_SAMPLE_MS};
+
+    let buffer = [];
+    let lastMoveT = 0;
+
+    const flush = () => {{
+        if (buffer.length === 0) return;
+        const batch = buffer;
+        buffer = [];
+        setTriggerValue("mouse_events", {{ events: batch }});
+    }};
+
+    const push = (entry) => {{
+        buffer.push(entry);
+        if (buffer.length >= MAX_EVENTS_PER_BATCH) flush();
+    }};
+
+    const BUTTON_NAMES = {{ 0: "left", 1: "middle", 2: "right" }};
+
+    const onMouseMove = (e) => {{
+        const now = Date.now();
+        if (now - lastMoveT < MOVE_SAMPLE_MS) return;
+        lastMoveT = now;
+        push({{ type: "move", x: e.clientX, y: e.clientY, t: now }});
+    }};
+
+    const onMouseDown = (e) => {{
+        push({{
+            type: "click",
+            button: BUTTON_NAMES[e.button] ?? "other",
+            x: e.clientX,
+            y: e.clientY,
+            t: Date.now(),
+        }});
+    }};
+
+    const onMouseLeave = () => push({{ type: "leave_window", t: Date.now() }});
+    const onMouseEnter = () => push({{ type: "enter_window", t: Date.now() }});
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("mouseenter", onMouseEnter);
+    const intervalHandle = setInterval(flush, FLUSH_INTERVAL_MS);
+
+    return () => {{
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mousedown", onMouseDown);
+        document.removeEventListener("mouseleave", onMouseLeave);
+        document.removeEventListener("mouseenter", onMouseEnter);
         clearInterval(intervalHandle);
     }};
 }}
@@ -365,6 +444,7 @@ export default function(component) {{
 # scope rather than inside the function.
 _tab_monitor          = st.components.v2.component("quiz_tab_monitor", js=_TAB_MONITOR_JS)
 _keystroke_monitor    = st.components.v2.component("quiz_keystroke_monitor", js=_KEYSTROKE_JS)
+_mouse_monitor        = st.components.v2.component("quiz_mouse_monitor", js=_MOUSE_JS)
 _screen_share_button  = st.components.v2.component("quiz_screen_share_button", js=_SCREEN_SHARE_JS)
 _webcam_monitor_button = st.components.v2.component("quiz_webcam_monitor_button", js=_WEBCAM_MONITOR_JS)
 
@@ -420,6 +500,39 @@ def save_proctor_keystrokes(
             VALUES (%s, %s, %s, %s, %s)
             """,
             (session_id, user_id, quiz_id, assessment_id, json.dumps(keys)),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def save_proctor_mouse_events(
+    session_id: str,
+    user_id: int,
+    quiz_id,
+    assessment_id,
+    events: list,
+) -> None:
+    """
+    Insert one batch of mouse events (as flushed by _MOUSE_JS — "move",
+    "click", "leave_window", "enter_window" entries) into
+    quiz_proctor_mouse_events as a single JSON-encoded row. Mirrors
+    save_proctor_keystrokes(); silently does nothing for an empty batch.
+    """
+    if not events:
+        return
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO quiz_proctor_mouse_events
+                (session_id, user_id, quiz_id, assessment_id, events_json)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (session_id, user_id, quiz_id, assessment_id, json.dumps(events)),
         )
         conn.commit()
     finally:
@@ -1121,6 +1234,119 @@ def _decode_keystroke_rows(rows: list[dict]) -> list[dict]:
     return keystrokes
 
 
+def get_proctor_mouse_events(session_id: str, limit: int = 200) -> list[dict]:
+    """
+    Return captured mouse-event batches for one proctoring session, oldest
+    first, with each row's events_json decoded back into a list of
+    {"type", "x", "y", "button", "t"} dicts. Mirrors get_proctor_keystrokes().
+    """
+    if not session_id:
+        return []
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+            SELECT events_json, captured_at
+            FROM quiz_proctor_mouse_events
+            WHERE session_id = %s
+            ORDER BY captured_at ASC
+            LIMIT %s
+            """,
+            (session_id, limit),
+        )
+        rows = cursor.fetchall() or []
+    finally:
+        cursor.close()
+        conn.close()
+
+    return _decode_mouse_event_rows(rows)
+
+
+def get_proctor_mouse_events_by_user_assessment(user_id: int, assessment_id, limit: int = 200) -> list[dict]:
+    """
+    Same as get_proctor_mouse_events(), aggregated across every proctoring
+    session this user has had for the given assessment — see
+    get_proctor_summary_by_user_assessment() for why this exists.
+    """
+    if not assessment_id:
+        return []
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+            SELECT events_json, captured_at
+            FROM quiz_proctor_mouse_events
+            WHERE user_id = %s AND assessment_id = %s
+            ORDER BY captured_at ASC
+            LIMIT %s
+            """,
+            (user_id, assessment_id, limit),
+        )
+        rows = cursor.fetchall() or []
+    finally:
+        cursor.close()
+        conn.close()
+
+    return _decode_mouse_event_rows(rows)
+
+
+def _decode_mouse_event_rows(rows: list[dict]) -> list[dict]:
+    """Flatten a list of {"events_json", "captured_at"} batch rows into one
+    list of individual mouse-event dicts, dropping any batch that fails to
+    decode rather than failing the whole review page."""
+    events = []
+    for row in rows:
+        try:
+            events.extend(json.loads(row["events_json"]))
+        except Exception:
+            continue
+    return events
+
+
+def format_mouse_events_for_display(events: list[dict]) -> str:
+    """
+    Summarize a flat list of mouse-event dicts (as returned by
+    get_proctor_mouse_events()/get_proctor_mouse_events_by_user_assessment())
+    for instructor review. Unlike format_keystrokes_for_display(), this
+    doesn't print a literal stream — raw coordinates aren't meaningful to
+    read at a glance — instead it reports activity counts: clicks (by
+    button), movement samples, and how many times the cursor left/re-entered
+    the browser window (a coarse signal for switching to another monitor or
+    device).
+    """
+    clicks_by_button: dict[str, int] = {}
+    move_count = 0
+    leave_count = 0
+    enter_count = 0
+
+    for entry in events:
+        kind = entry.get("type")
+        if kind == "click":
+            button = entry.get("button", "other")
+            clicks_by_button[button] = clicks_by_button.get(button, 0) + 1
+        elif kind == "move":
+            move_count += 1
+        elif kind == "leave_window":
+            leave_count += 1
+        elif kind == "enter_window":
+            enter_count += 1
+
+    total_clicks = sum(clicks_by_button.values())
+    click_breakdown = ", ".join(
+        f"{count} {button}" for button, count in sorted(clicks_by_button.items())
+    )
+    lines = [
+        f"{total_clicks} click(s)" + (f" ({click_breakdown})" if click_breakdown else ""),
+        f"{move_count} movement sample(s)",
+        f"{leave_count} window-leave / {enter_count} window-re-enter event(s)",
+    ]
+    return "\n".join(lines)
+
+
 _KEY_NAME_OVERRIDES = {" ": "Space"}
 
 
@@ -1168,11 +1394,11 @@ def delete_proctor_session(session_id: str) -> dict:
 
     Returns {"events_deleted": int, "frames_deleted": int,
     "webcam_frames_deleted": int, "files_removed": int,
-    "keystrokes_deleted": int}.
+    "keystrokes_deleted": int, "mouse_events_deleted": int}.
     """
     empty = {
         "events_deleted": 0, "frames_deleted": 0, "webcam_frames_deleted": 0,
-        "files_removed": 0, "keystrokes_deleted": 0,
+        "files_removed": 0, "keystrokes_deleted": 0, "mouse_events_deleted": 0,
     }
     if not session_id:
         return empty
@@ -1218,6 +1444,9 @@ def delete_proctor_session(session_id: str) -> dict:
         cursor.execute("DELETE FROM quiz_proctor_keystrokes WHERE session_id = %s", (session_id,))
         keystrokes_deleted = cursor.rowcount
 
+        cursor.execute("DELETE FROM quiz_proctor_mouse_events WHERE session_id = %s", (session_id,))
+        mouse_events_deleted = cursor.rowcount
+
         conn.commit()
     finally:
         cursor.close()
@@ -1229,6 +1458,7 @@ def delete_proctor_session(session_id: str) -> dict:
         "webcam_frames_deleted": webcam_frames_deleted,
         "files_removed": files_removed,
         "keystrokes_deleted": keystrokes_deleted,
+        "mouse_events_deleted": mouse_events_deleted,
     }
 
 
@@ -1248,11 +1478,11 @@ def delete_proctor_data_for_user_assessment(user_id: int, assessment_id) -> dict
 
     Returns {"events_deleted": int, "frames_deleted": int,
     "webcam_frames_deleted": int, "files_removed": int,
-    "keystrokes_deleted": int}.
+    "keystrokes_deleted": int, "mouse_events_deleted": int}.
     """
     empty = {
         "events_deleted": 0, "frames_deleted": 0, "webcam_frames_deleted": 0,
-        "files_removed": 0, "keystrokes_deleted": 0,
+        "files_removed": 0, "keystrokes_deleted": 0, "mouse_events_deleted": 0,
     }
     if not assessment_id:
         return empty
@@ -1310,6 +1540,12 @@ def delete_proctor_data_for_user_assessment(user_id: int, assessment_id) -> dict
         )
         keystrokes_deleted = cursor.rowcount
 
+        cursor.execute(
+            "DELETE FROM quiz_proctor_mouse_events WHERE user_id = %s AND assessment_id = %s",
+            (user_id, assessment_id),
+        )
+        mouse_events_deleted = cursor.rowcount
+
         conn.commit()
     finally:
         cursor.close()
@@ -1321,6 +1557,7 @@ def delete_proctor_data_for_user_assessment(user_id: int, assessment_id) -> dict
         "webcam_frames_deleted": webcam_frames_deleted,
         "files_removed": files_removed,
         "keystrokes_deleted": keystrokes_deleted,
+        "mouse_events_deleted": mouse_events_deleted,
     }
 
 
@@ -1340,9 +1577,10 @@ def cleanup_old_proctor_data(retention_days: int = 7) -> dict:
 
     Returns {"events_deleted": int, "frames_deleted": int,
     "webcam_frames_deleted": int, "files_removed": int,
-    "keystrokes_deleted": int}. files_removed may be lower than
-    frames_deleted + webcam_frames_deleted if some files were already missing
-    from disk (e.g. removed manually) — that is not an error here.
+    "keystrokes_deleted": int, "mouse_events_deleted": int}. files_removed
+    may be lower than frames_deleted + webcam_frames_deleted if some files
+    were already missing from disk (e.g. removed manually) — that is not an
+    error here.
     """
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -1399,6 +1637,12 @@ def cleanup_old_proctor_data(retention_days: int = 7) -> dict:
         )
         keystrokes_deleted = cursor.rowcount
 
+        cursor.execute(
+            "DELETE FROM quiz_proctor_mouse_events WHERE captured_at < (NOW() - INTERVAL %s DAY)",
+            (retention_days,),
+        )
+        mouse_events_deleted = cursor.rowcount
+
         conn.commit()
     finally:
         cursor.close()
@@ -1410,6 +1654,7 @@ def cleanup_old_proctor_data(retention_days: int = 7) -> dict:
         "webcam_frames_deleted": webcam_frames_deleted,
         "files_removed": files_removed,
         "keystrokes_deleted": keystrokes_deleted,
+        "mouse_events_deleted": mouse_events_deleted,
     }
 
 
@@ -1436,9 +1681,9 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
     if share_key not in st.session_state:
         st.info(
             "This quiz is monitored for academic integrity. Tab switches, "
-            "window focus changes, and keys you press on this page are "
-            "recorded automatically. You'll also be asked to share your "
-            "screen and enable your camera below — your browser will show "
+            "window focus changes, keys you press, and mouse activity on "
+            "this page are recorded automatically. You'll also be asked to "
+            "share your screen and enable your camera below — your browser will show "
             "its own permission dialog for each. Once granted, periodic "
             "snapshots of your screen and your face are saved for "
             "instructor review; the webcam snapshots are also checked for "
@@ -1517,6 +1762,20 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
             keystroke_result.keystrokes.get("keys", []),
         )
 
+    # ---- Always-on mouse-activity logger ----
+    # Same always-mounted, buffered-batch pattern as the keystroke logger
+    # above — clicks, throttled movement samples, and cursor leave/re-enter
+    # of the browser window.
+    mouse_result = _mouse_monitor(
+        key=f"proctor_mouse_{session_id}",
+        on_mouse_events_change=lambda: None,
+    )
+    if mouse_result.mouse_events is not None:
+        save_proctor_mouse_events(
+            session_id, user_id, quiz_id, assessment_id,
+            mouse_result.mouse_events.get("events", []),
+        )
+
     # Webcam face/gaze flags (no_face/multiple_faces/looking_away) are
     # intentionally not surfaced here or as a live st.warning() the way
     # tab-switch/focus-loss is above — a single misread frame is too noisy a
@@ -1530,7 +1789,7 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
     else:
         st.caption(
             "🟢 Monitoring active — tab switches, focus loss, keystrokes, "
-            "and (once enabled) your camera are being recorded."
+            "mouse activity, and (once enabled) your camera are being recorded."
         )
 
     return session_id

@@ -69,6 +69,8 @@ from src.features.proctoring.proctoring_feature import (
     get_proctor_webcam_frames,
     get_proctor_keystrokes,
     format_keystrokes_for_display,
+    get_proctor_mouse_events,
+    format_mouse_events_for_display,
     delete_proctor_session,
 )
 
@@ -1386,6 +1388,14 @@ def render_instructor_attempts_tab(assessment_id: int) -> None:
                 with st.expander(f"⌨️ Keystrokes Logged ({len(keystrokes)})", expanded=False):
                     st.text(format_keystrokes_for_display(keystrokes))
 
+            # Mouse activity (clicks, throttled movement samples, window
+            # leave/re-enter) while the student had the quiz open, flushed in
+            # batches every MOUSE_FLUSH_INTERVAL_MS — see proctoring_feature.py.
+            mouse_events = get_proctor_mouse_events(attempt.get("proctor_session_id"))
+            if mouse_events:
+                with st.expander(f"🖱️ Mouse Activity Logged ({len(mouse_events)})", expanded=False):
+                    st.text(format_mouse_events_for_display(mouse_events))
+
             # Display the source files used to generate this quiz so the
             # instructor can identify which study materials the student used.
             try:
@@ -1564,15 +1574,15 @@ def _dialog_delete_quiz_attempt(attempt_id: int) -> None:
 def _dialog_delete_proctor_session(session_id: str) -> None:
     """
     Confirmation modal for an instructor permanently deleting the tab-switch
-    events, screen-capture frames, webcam frames, and keystroke logs tied to
-    one quiz attempt's proctoring session — the attempt and its score are
-    unaffected.
+    events, screen-capture frames, webcam frames, keystroke logs, and mouse
+    activity logs tied to one quiz attempt's proctoring session — the
+    attempt and its score are unaffected.
     """
     st.warning(
         "Are you sure you want to delete the tab-switch/focus events, "
-        "screen-capture frames, webcam frames, and keystroke logs recorded "
-        "for this attempt? The attempt and its score are not affected. "
-        "This cannot be undone."
+        "screen-capture frames, webcam frames, keystroke logs, and mouse "
+        "activity logs recorded for this attempt? The attempt and its score "
+        "are not affected. This cannot be undone."
     )
     col1, col2 = st.columns(2)
     if col1.button("Delete", type="primary", key="proctor_dialog_confirm_delete"):

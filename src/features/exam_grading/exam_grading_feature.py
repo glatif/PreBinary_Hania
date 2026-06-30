@@ -48,6 +48,8 @@ from src.features.proctoring.proctoring_feature import (
     get_proctor_webcam_frames_by_user_assessment,
     get_proctor_keystrokes_by_user_assessment,
     format_keystrokes_for_display,
+    get_proctor_mouse_events_by_user_assessment,
+    format_mouse_events_for_display,
     delete_proctor_data_for_user_assessment,
 )
 
@@ -895,8 +897,8 @@ def _dialog_delete_grading_session(grading_session_id: str, user_id: int) -> Non
 def _dialog_delete_proctor_data(user_id: int, assessment_id: int) -> None:
     """
     Confirmation modal for permanently deleting this student's tab-switch
-    events, screen-capture frames, webcam frames, and keystroke logs for
-    this assessment.
+    events, screen-capture frames, webcam frames, keystroke logs, and mouse
+    activity logs for this assessment.
 
     Uploaded files aren't pinned to a single proctoring session_id (see
     get_proctor_summary_by_user_assessment), so unlike the Practice Quiz
@@ -906,9 +908,9 @@ def _dialog_delete_proctor_data(user_id: int, assessment_id: int) -> None:
     """
     st.warning(
         "Are you sure you want to delete ALL tab-switch/focus events, "
-        "screen-capture frames, webcam frames, and keystroke logs recorded "
-        "for this student across this entire assessment? Submitted files "
-        "are not affected. This cannot be undone."
+        "screen-capture frames, webcam frames, keystroke logs, and mouse "
+        "activity logs recorded for this student across this entire "
+        "assessment? Submitted files are not affected. This cannot be undone."
     )
     col1, col2 = st.columns(2)
     if col1.button("Delete", type="primary", key="eg_proctor_dialog_confirm_delete"):
@@ -1395,6 +1397,15 @@ def exam_grading_ui() -> None:
                         if keystrokes:
                             with st.expander(f"⌨️ Keystrokes Logged ({len(keystrokes)})", expanded=False):
                                 st.text(format_keystrokes_for_display(keystrokes))
+
+                        # Mouse activity (clicks, throttled movement samples,
+                        # window leave/re-enter) between verification and
+                        # upload, flushed in batches every
+                        # MOUSE_FLUSH_INTERVAL_MS — see proctoring_feature.py.
+                        mouse_events = get_proctor_mouse_events_by_user_assessment(row["uploaded_by"], assessment_id)
+                        if mouse_events:
+                            with st.expander(f"🖱️ Mouse Activity Logged ({len(mouse_events)})", expanded=False):
+                                st.text(format_mouse_events_for_display(mouse_events))
 
                     if st.button("Load Student-Submitted Files into Grading Queue", key="load_student_files_btn"):
                         with st.spinner("Processing student-submitted files..."):
