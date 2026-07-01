@@ -893,51 +893,29 @@ def _dialog_delete_grading_session(grading_session_id: str, user_id: int) -> Non
         st.rerun()
 
 
-@st.dialog("Delete Monitoring Data")
-def _dialog_delete_proctor_data(user_id: int, assessment_id: int) -> None:
+@st.dialog("Delete Entire Submission")
+def _dialog_delete_entire_submission(
+    file_id: int,
+    file_name: str,
+    file_path: str,
+    student_name: str,
+    user_id: int,
+    assessment_id: int,
+) -> None:
     """
-    Confirmation modal for permanently deleting this student's tab-switch
-    events, screen-capture frames, webcam frames, keystroke logs, and mouse
-    activity logs for this assessment.
-
-    Uploaded files aren't pinned to a single proctoring session_id (see
-    get_proctor_summary_by_user_assessment), so unlike the Practice Quiz
-    review this clears every proctoring session this student has had for
-    the assessment, not just one upload — submitted files themselves are
-    unaffected.
-    """
-    st.warning(
-        "Are you sure you want to delete ALL tab-switch/focus events, "
-        "screen-capture frames, webcam frames, keystroke logs, and mouse "
-        "activity logs recorded for this student across this entire "
-        "assessment? Submitted files are not affected. This cannot be undone."
-    )
-    col1, col2 = st.columns(2)
-    if col1.button("Delete", type="primary", key="eg_proctor_dialog_confirm_delete"):
-        delete_proctor_data_for_user_assessment(user_id, assessment_id)
-        st.toast("Monitoring data deleted.")
-        st.rerun()
-    if col2.button("Cancel", key="eg_proctor_dialog_cancel_delete"):
-        st.rerun()
-
-
-@st.dialog("Delete Submitted File")
-def _dialog_delete_exam_submission_file(file_id: int, file_name: str, file_path: str, student_name: str) -> None:
-    """
-    Confirmation modal for an admin/teacher permanently deleting a single
-    file a student submitted through "Submit My Exam".
-
-    Removes both the files table row and the file on disk. Does not touch
-    that student's proctoring data (see _dialog_delete_proctor_data) or any
-    grading results already produced from this file — if it was already
-    loaded into the grading queue and graded, that result is unaffected.
+    Confirmation modal for permanently deleting everything associated with one
+    student's exam submission: the submitted file (files row + file on disk)
+    and all proctoring data for that student+assessment (tab-switch events,
+    screen/webcam frames, keystroke logs, mouse activity logs).
     """
     st.warning(
         f"Are you sure you want to delete **{file_name}** submitted by "
-        f"**{student_name}**? This cannot be undone."
+        f"**{student_name}**, together with all monitoring data (tab-switch "
+        f"events, screen/webcam frames, keystroke and mouse activity logs) "
+        f"recorded for this student across this assessment? This cannot be undone."
     )
     col1, col2 = st.columns(2)
-    if col1.button("Delete", type="primary", key="eg_submission_dialog_confirm_delete"):
+    if col1.button("Delete everything", type="primary", key="eg_full_dialog_confirm_delete"):
         conn = get_connection()
         cursor = conn.cursor()
         try:
@@ -947,9 +925,10 @@ def _dialog_delete_exam_submission_file(file_id: int, file_name: str, file_path:
             cursor.close()
             conn.close()
         delete_physical_file(file_path)
-        st.toast("Submitted file deleted.")
+        delete_proctor_data_for_user_assessment(user_id, assessment_id)
+        st.toast("Submission and monitoring data deleted.")
         st.rerun()
-    if col2.button("Cancel", key="eg_submission_dialog_cancel_delete"):
+    if col2.button("Cancel", key="eg_full_dialog_cancel_delete"):
         st.rerun()
 
 
@@ -1308,11 +1287,13 @@ def exam_grading_ui() -> None:
                             st.write(f"**{name}**{roll_suffix} — `{row['file_name']}`")
                         with file_del_col:
                             if st.session_state["user"].get("role") in ("admin", "teacher") and st.button(
-                                "🗑️ Delete file",
+                                "🗑️ Delete submission",
                                 key=f"eg_del_submission_{row['id']}",
+                                help="Delete this file and all associated monitoring data",
                             ):
-                                _dialog_delete_exam_submission_file(
+                                _dialog_delete_entire_submission(
                                     row["id"], row["file_name"], row["file_path"], name,
+                                    row["uploaded_by"], assessment_id,
                                 )
 
                         # Tab-switch/focus-loss and screen-share summary recorded
@@ -1327,18 +1308,10 @@ def exam_grading_ui() -> None:
                         }[proctor["screen_share"]]
                         violation_count = proctor["violation_count"]
                         violation_icon  = "🔴" if violation_count else "🟢"
-                        mon_col1, mon_col2 = st.columns([5, 1])
-                        with mon_col1:
-                            st.caption(
-                                f"{violation_icon} {violation_count} tab-switch/focus warning(s) — "
-                                f"Screen share: {share_label}"
-                            )
-                        with mon_col2:
-                            if st.button(
-                                "🗑️ Delete monitoring data",
-                                key=f"eg_del_proctor_{row['id']}",
-                            ):
-                                _dialog_delete_proctor_data(row["uploaded_by"], assessment_id)
+                        st.caption(
+                            f"{violation_icon} {violation_count} tab-switch/focus warning(s) — "
+                            f"Screen share: {share_label}"
+                        )
 
                         # Screen-share snapshots captured between verification
                         # and upload, downscaled JPEGs taken every
