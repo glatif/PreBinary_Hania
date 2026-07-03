@@ -13,8 +13,9 @@ This document summarises the latest updates made across the AI Instructor system
 * Narrated Slideshow Generator
 * Student Verification for Quiz Submission
 * Proctoring: Keystroke Tracking and Monitoring Data Controls
+* Oral Examination Feature
 
-The updates focus on improving upload flexibility, URL scraping, slideshow narration, video generation, quiz submission verification, proctoring monitoring, and monitoring data management.
+The updates focus on improving upload flexibility, URL scraping, slideshow narration, video generation, quiz submission verification, proctoring monitoring, monitoring data management, and adding a new fully proctored, AI-graded oral examination workflow.
 
 ---
 
@@ -153,7 +154,35 @@ This is in addition to the existing age-based bulk cleanup option in the Admin P
 
 ---
 
-# 6. Overall Status
+# 6. Oral Examination Feature
+
+## Summary
+
+A new Oral Examination feature has been added as its own tab in the main dashboard, alongside Exam Grading, Exam Creation, and Practice Quiz. An AI generates open-ended exam questions from teacher-provided material, students answer by speaking into their microphone, and the AI grades the transcribed answers once the teacher runs grading.
+
+The feature reuses the existing proctoring system rather than duplicating it, so the same monitoring already used by Exam Grading — screen-share capture, webcam with face/eye-gaze and head-pose analysis, keystroke logging, and mouse activity logging — runs for the full oral exam session.
+
+## Current Status
+
+The feature is fully built and wired into the dashboard, and the required database tables have been created. Questions are revealed to students one at a time and are not shown in advance; once a student has answered every question the exam is locked, with no re-submission.
+
+Recorded answers are transcribed automatically using Groq's or OpenAI's Whisper API (Groq preferred when both are available) — students need one of these keys saved on their account, and are now warned up front, before identity verification and recording, if neither is set.
+
+Teachers grade all completed responses in one batch against a saved rubric, using the same grading logic as Exam Grading. Results include a per-question score, feedback, and detailed explanation, plus each student's proctoring summary for review alongside their grade. Past grading runs can be revisited in a History tab.
+
+Manual testing surfaced and fixed two real issues: AI question generation was initially returning only 1 question instead of the requested number (caused by an incorrect JSON-mode flag plus a local model needing a more explicit prompt), and students were only finding out they needed an API key after already recording an answer rather than before. Both are fixed and verified.
+
+## Testing Still Required
+
+* Full student flow end-to-end with a Groq or OpenAI key configured, including transcription accuracy
+* AI question generation reliability across different models (cloud models vs. small local Ollama models)
+* Batch grading across a full class-sized set of students and questions
+* Teachers editing/re-saving questions after students have already started answering (a warning is shown, but question numbering has no versioning)
+* Concurrent or repeated submissions for the same question (a database constraint now prevents duplicate rows, but this hasn't been tested under real concurrent use)
+
+---
+
+# 7. Overall Status
 
 The main updates are working at a basic level, but further testing is still required before the features can be considered fully stable.
 
@@ -167,5 +196,6 @@ Current progress includes:
 * Started student verification for quiz submission
 * Added keystroke tracking for proctoring
 * Added monitoring data controls for admins and teachers
+* Added Oral Examination feature with AI question generation, proctored spoken answers, and AI grading
 
 ---

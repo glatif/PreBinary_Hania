@@ -202,6 +202,74 @@ def stream_openai_llm(prompt: str, api_key: str) -> Generator[str, None, None]:
     except requests.exceptions.RequestException as e:
         yield f"Error: Failed to get response from OpenAI. Details: {str(e)}"
 
+def _transcribe_audio_openai_compatible(
+    audio_bytes: bytes,
+    filename: str,
+    api_key: str,
+    url: str,
+    model: str,
+    provider_label: str,
+) -> str:
+    """
+    Transcribe audio via any OpenAI-compatible /audio/transcriptions endpoint.
+
+    Groq and OpenAI both expose the same multipart request/response shape for
+    Whisper transcription, so one implementation covers both — mirroring how
+    _stream_openai_compatible_chat() already collapses this file's
+    structurally identical chat providers into a single function.
+
+    Returns:
+        The transcript text, or an error string prefixed with 'Error:'.
+    """
+    headers = {"Authorization": f"Bearer {api_key}"}
+    files = {"file": (filename, audio_bytes)}
+    data = {"model": model}
+
+    try:
+        response = requests.post(url, headers=headers, files=files, data=data)
+        response.raise_for_status()
+        return response.json().get("text", "")
+    except requests.exceptions.RequestException as e:
+        return f"Error: Failed to transcribe audio via {provider_label}. Details: {str(e)}"
+
+
+def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
+    """
+    Transcribe a spoken answer to text, used by the Oral Examination feature.
+
+    Dispatches to whichever speech-to-text provider the current user has an
+    API key for, preferring Groq (faster, cheaper) over OpenAI. Mirrors the
+    'Error: ...' string convention used by generate_llm_response() and
+    friends so callers can display the result directly without a separate
+    error-handling path.
+
+    Args:
+        audio_bytes: Raw audio file bytes (WAV, as produced by st.audio_input).
+        filename: Filename to forward to the transcription API.
+
+    Returns:
+        The transcript text, or an error string prefixed with 'Error:'.
+    """
+    if st.session_state.get("groq_api_key"):
+        return _transcribe_audio_openai_compatible(
+            audio_bytes, filename, st.session_state.groq_api_key,
+            url="https://api.groq.com/openai/v1/audio/transcriptions",
+            model="whisper-large-v3-turbo",
+            provider_label="Groq",
+        )
+    if st.session_state.get("openai_api_key"):
+        return _transcribe_audio_openai_compatible(
+            audio_bytes, filename, st.session_state.openai_api_key,
+            url="https://api.openai.com/v1/audio/transcriptions",
+            model="whisper-1",
+            provider_label="OpenAI",
+        )
+    return (
+        "Error: No speech-to-text provider configured. Add a Groq or OpenAI "
+        "API key in your profile settings."
+    )
+
+
 def strip_llm_json(raw: str) -> str:
     """
     Strip markdown code fences from an LLM response before JSON parsing.
