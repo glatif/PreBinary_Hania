@@ -172,6 +172,18 @@ Teachers grade all completed responses in one batch against a saved rubric, usin
 
 Manual testing surfaced and fixed two real issues: AI question generation was initially returning only 1 question instead of the requested number (caused by an incorrect JSON-mode flag plus a local model needing a more explicit prompt), and students were only finding out they needed an API key after already recording an answer rather than before. Both are fixed and verified.
 
+## Setup Required
+
+Pulling the latest code is not enough on its own to get this feature working — the following steps are also needed on any machine running this app for the first time after this update:
+
+* Run the new migration once against the app's MySQL database, in addition to every other `migration_add_*.sql` file already required by this project (there is no automated migration runner):
+  ```
+  mysql -u streamlit_user -p streamlit_database < migration_add_oral_examination.sql
+  ```
+* Save a Groq or OpenAI API key under Profile → AI API Keys on any account that will take an oral exam — this is stored per-user in the database and does not come across with the code, and transcription will not work without it.
+* If using the default local model (DeepSeek via Ollama) for question generation, make sure Ollama is running locally with `deepseek-r1:1.5b` pulled; otherwise select a cloud model that account has a saved key for.
+* No new Python packages were added, so a normal `pip install -r requirements.txt` is sufficient — no extra dependency setup is required.
+
 ## Testing Still Required
 
 * Full student flow end-to-end with a Groq or OpenAI key configured, including transcription accuracy
