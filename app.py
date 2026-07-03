@@ -154,6 +154,7 @@ from src.features.exam_creation.exam_creation_feature import exam_creation_ui
 from src.features.advisor_ai.advisor_ai_feature import advisor_ai_ui
 from src.features.student_wellness.student_wellness_feature import student_wellness_ui
 from src.features.quiz_generator.quiz_generator_feature import quiz_generator_ui
+from src.features.oral_examination.oral_examination_feature import oral_examination_ui
 from src.features.narrated_slideshow.narrated_slideshow_feature import render_narrated_slideshow_feature
 from src.features.proctoring.proctoring_feature import cleanup_old_proctor_data
 
@@ -307,7 +308,7 @@ if "selected_assessment" not in st.session_state:
 # Each tab maintains independent view_level, selected_course, and
 # selected_assessment so that navigating into a course under one tab
 # does not affect the navigation state of any other tab.
-for _tab_prefix in ("exam_grading", "exam_creation", "practice_quiz"):
+for _tab_prefix in ("exam_grading", "exam_creation", "practice_quiz", "oral_examination"):
     if f"{_tab_prefix}_view_level" not in st.session_state:
         st.session_state[f"{_tab_prefix}_view_level"] = "courses"
     if f"{_tab_prefix}_selected_course" not in st.session_state:
@@ -343,7 +344,7 @@ def _nav_key(base: str, tab_key: str | None = None) -> str:
 
     When tab_key is provided (e.g. 'exam_grading'), the returned key is
     '{tab_key}_{base}' (e.g. 'exam_grading_view_level'). This prevents
-    DuplicateWidgetID errors when Streamlit renders all three feature tabs
+    DuplicateWidgetID errors when Streamlit renders all four feature tabs
     simultaneously in the DOM.
 
     When tab_key is None the base key is returned unchanged, preserving
@@ -356,7 +357,7 @@ def reset_navigation(tab_key=None):
     """
     When tab_key is provided, resets only that tab's three per-tab navigation
     keys (e.g. 'exam_grading_view_level', 'exam_grading_selected_course',
-    'exam_grading_selected_assessment'). This allows each of the three feature
+    'exam_grading_selected_assessment'). This allows each of the four feature
     tabs to be independently reset without disturbing the others.
 
     When tab_key is None, resets the global navigation keys used by the shared
@@ -548,7 +549,7 @@ def render_sidebar():
             # Reset global nav state, all three per-tab nav states, and the
             # admin panel courses nav so all views return to their course list.
             reset_navigation()
-            for _tk in ("exam_grading", "exam_creation", "practice_quiz"):
+            for _tk in ("exam_grading", "exam_creation", "practice_quiz", "oral_examination"):
                 reset_navigation(_tk)
             st.session_state.admin_panel_view_level = "courses"
             st.session_state.admin_panel_selected_course = None
@@ -565,7 +566,7 @@ def render_sidebar():
                 # Reset dashboard nav and admin panel courses nav so both
                 # return to their course lists when the page is re-entered.
                 reset_navigation()
-                for _tk in ("exam_grading", "exam_creation", "practice_quiz"):
+                for _tk in ("exam_grading", "exam_creation", "practice_quiz", "oral_examination"):
                     reset_navigation(_tk)
                 st.session_state.admin_panel_view_level = "courses"
                 st.session_state.admin_panel_selected_course = None
@@ -1965,6 +1966,29 @@ def _render_practice_quiz_tab():
         quiz_generator_ui()
 
 
+def _render_oral_examination_tab():
+    """
+    Entry point for the Oral Examination feature tab.
+
+    Renders the course list at the top level, the assessment list after a
+    course is selected, and the Oral Examination feature UI once an
+    assessment is opened. Navigation state is fully isolated from the other
+    three feature tabs.
+    """
+    tab_key = "oral_examination"
+    level = st.session_state[f"{tab_key}_view_level"]
+
+    if level in ("assessments", "files"):
+        render_breadcrumb(tab_key)
+
+    if level == "courses":
+        render_courses_view(get_engine(), tab_key)
+    elif level == "assessments":
+        render_assessments_view(get_engine(), tab_key)
+    elif level == "files":
+        oral_examination_ui()
+
+
 def render_dashboard():
     """
     Shared dashboard content rendered for all authenticated roles.
@@ -1979,10 +2003,12 @@ def render_dashboard():
     appear greyed-out or disabled, they simply do not exist for that user.
 
     Role rules (from the integration plan tab visibility table):
-      admin / teacher — all eight tabs including Exam Grading, Exam Creation,
-                        and Video Lectures.
-      student         — five tabs; Exam Grading, Exam Creation, and Video
-                        Lectures are removed from the list before rendering.
+      admin / teacher — all nine tabs including Exam Grading, Exam Creation,
+                        Oral Examination, and Video Lectures.
+      student         — eight tabs; Exam Creation is removed from the list
+                        before rendering. Exam Grading and Oral Examination
+                        stay visible — each renders a cut-down student view
+                        instead of the full teacher/admin workflow.
 
     The tab-to-function mapping is built as a list of (label, render_fn) tuples
     which is filtered by role, then passed to st.tabs(). Each resulting tab
@@ -2005,6 +2031,7 @@ def render_dashboard():
         ("🎓 Advisor AI",               advisor_ai_ui),
         ("🌟 Student Wellness",         student_wellness_ui),
         ("🧠 Practice for Exam/Quiz",   _render_practice_quiz_tab),
+        ("🎤 Oral Examination",         _render_oral_examination_tab),
         ("🎬 Video Lectures",           render_narrated_slideshow_feature),
         ("➕ More Features Coming Soon", _render_more_features_tab),
     ]
@@ -2093,7 +2120,7 @@ def admin_page():
     Entry point for users with the admin role on the Dashboard page.
 
     Delegates entirely to render_dashboard(), which builds the feature tab list
-    dynamically. Admins see all eight tabs. User management has moved to the
+    dynamically. Admins see all nine tabs. User management has moved to the
     standalone admin_panel_page(), reachable via the Admin Panel sidebar button.
     """
     st.title("Dashboard")
@@ -3003,8 +3030,8 @@ def teacher_page():
     Entry point for users with the teacher role on the Dashboard page.
 
     Delegates to render_dashboard(), which builds the feature tab list
-    dynamically. Teachers see all eight tabs, including Exam Grading, Exam
-    Creation, and Video Lectures.
+    dynamically. Teachers see all nine tabs, including Exam Grading, Exam
+    Creation, Oral Examination, and Video Lectures.
     """
     st.title("Dashboard")
     render_dashboard()
@@ -3015,8 +3042,9 @@ def student_page():
     Entry point for users with the student role on the Dashboard page.
 
     Delegates to render_dashboard(), which filters the tab list based on role.
-    Students see six tabs — Exam Grading and Exam Creation are excluded
-    entirely from the rendered tab set.
+    Students see eight tabs — Exam Creation is excluded entirely from the
+    rendered tab set; Exam Grading and Oral Examination stay visible and each
+    render a cut-down student view instead of the full teacher/admin workflow.
     """
     st.title("Dashboard")
     render_dashboard()

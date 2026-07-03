@@ -49,10 +49,13 @@ UPLOAD_ROOT = Path("uploads")
 # .zip is included to support Exam Grading, which accepts a ZIP archive of
 # student PDF submissions. The ZIP is saved to disk before extraction so the
 # original submission bundle is preserved under the course/assessment directory.
+# .wav is included to support Oral Examination, which saves each student's
+# recorded answer (captured via st.audio_input, which produces WAV) to disk
+# alongside its transcript.
 ALLOWED_EXTENSIONS = {
     ".pdf", ".txt", ".png", ".jpg", ".jpeg",
     ".webp", ".md", ".html", ".json", ".xml", ".csv",
-    ".docx", ".pptx", ".zip",
+    ".docx", ".pptx", ".zip", ".wav",
 }
 
 
