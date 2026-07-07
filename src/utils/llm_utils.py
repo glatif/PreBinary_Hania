@@ -310,22 +310,179 @@ def strip_llm_json(raw: str) -> str:
     #   - Prose before or after the JSON block
     #   - Fences with trailing notes after the closing ```
     #
-    # The brace-matching walk correctly handles nested objects so the entire
-    # JSON structure is extracted regardless of depth.
+    # The bracket-matching walk tracks whether it is inside a string literal
+    # so that literal { } [ ] characters inside question/answer text don't
+    # throw off the nesting count, and it tracks a full stack (not just an
+    # object depth counter) so both objects and arrays nest correctly. While
+    # inside a string it also escapes any raw control characters (e.g. a
+    # literal newline the model emitted instead of the "\n" escape sequence)
+    # since Python's json.loads rejects those with an "Invalid control
+    # character" error.
+    control_escapes = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+    _VALUE_END = object()  # sentinel: "a true/false/null literal just ended"
     start = stripped.find("{")
     if start != -1:
-        depth = 0
-        end   = -1
-        for i, ch in enumerate(stripped[start:], start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
+        text = stripped[start:]
+        n = len(text)
+        stack = []
+        in_string = False
+        escape = False
+        out = []
+        closed = False
+        # Tracks the last non-whitespace character written to `out`, so a
+        # missing comma between object members / array elements (e.g. the
+        # model forgot the comma after `"options": [...]` and went straight
+        # into `"correct_answer": ...`) can be detected: a value can only
+        # legitimately end with '"', '}', ']', or a digit, so seeing one of
+        # those immediately before the start of a new string/object/array
+        # (with no comma in between) means a comma was dropped.
+        last_nonspace = ""
+        i = 0
+        while i < n:
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                    out.append(ch)
+                    i += 1
+                    continue
+                if ch == "\\":
+                    escape = True
+                    out.append(ch)
+                    i += 1
+                    continue
+                if ch == '"':
+                    # Models frequently quote a term inside a string value
+                    # (e.g. `"question_text": "the "Big Bang" theory..."`)
+                    # without escaping the inner quotes, which makes a naive
+                    # parser think the string ends early - the very next
+                    # non-space character then isn't a valid JSON delimiter,
+                    # which is what produces the "Expecting ',' delimiter"
+                    # error. Disambiguate by peeking past this quote: a real
+                    # string terminator is always followed (after optional
+                    # whitespace) by one of : , } ] " { [ or the end of input
+                    # - the model never legitimately types a raw structural
+                    # character directly after a literal inner quote, so any
+                    # of those means this quote really does end the string
+                    # (" specifically covers a missing comma before the next
+                    # key/element, which the last_nonspace check below then
+                    # patches up). Anything else (a letter, digit, punctuation)
+                    # means the quote is literal content, so escape it instead
+                    # and keep treating the rest as string content.
+                    j = i + 1
+                    while j < n and text[j] in " \t\r\n":
+                        j += 1
+                    next_ch = text[j] if j < n else ""
+                    if next_ch in ":,}]\"{[" or next_ch == "":
+                        in_string = False
+                        out.append(ch)
+                        last_nonspace = '"'
+                    else:
+                        out.append('\\"')
+                    i += 1
+                    continue
+                if ch in control_escapes:
+                    out.append(control_escapes[ch])
+                elif ord(ch) < 0x20:
+                    out.append(f"\\u{ord(ch):04x}")
+                else:
+                    out.append(ch)
+                i += 1
+                continue
+
+            # An unquoted bareword where a value is expected (e.g. the model
+            # wrote `["Lee et al.", Liu et al., Meincke et al."]`, forgetting
+            # the quotes on some array entries) - true/false/null are the
+            # only bare identifiers valid JSON ever has outside a string, so
+            # any other run of letters here means missing quotes. Wrap it in
+            # quotes up to the next structural delimiter.
+            if ch.isalpha():
+                matched_lit = None
+                for lit in ("true", "false", "null"):
+                    end = i + len(lit)
+                    if text[i:end] == lit and (end >= n or not (text[end].isalnum() or text[end] == "_")):
+                        matched_lit = lit
+                        break
+                if matched_lit is not None:
+                    # Consume the whole literal token in one step - handling
+                    # only the first character here and falling through would
+                    # leave the remaining letters (e.g. "rue" after "t") to be
+                    # re-examined next iteration and wrongly bareword-wrapped.
+                    out.append(matched_lit)
+                    # _VALUE_END is a sentinel distinct from any real
+                    # character, marking "a value literal just ended" for the
+                    # missing-comma check below (true/false/null don't end in
+                    # a quote/brace/bracket/digit like other value types do).
+                    last_nonspace = _VALUE_END
+                    i += len(matched_lit)
+                    continue
+
+                j = i
+                while j < n and text[j] not in ',}]"':
+                    j += 1
+                word = text[i:j].rstrip()
+                if last_nonspace in ('"', '}', ']', _VALUE_END) or last_nonspace.isdigit():
+                    out.append(",")
+                escaped = word.replace("\\", "\\\\").replace('"', '\\"')
+                out.append('"' + escaped + '"')
+                last_nonspace = '"'
+                if j < n and text[j] == '"':
+                    # A stray quote right after the bareword is almost
+                    # always the model's mismatched attempt to close a
+                    # quote it never opened, rather than the start of a
+                    # new value - only treat it that way (consume and
+                    # discard it) when a real delimiter follows; otherwise
+                    # leave it for normal string handling.
+                    k = j + 1
+                    while k < n and text[k] in " \t\r\n":
+                        k += 1
+                    after = text[k] if k < n else ""
+                    if after in ",}]" or after == "":
+                        j += 1
+                i = j
+                continue
+
+            if ch in '"{[' and (last_nonspace in ('"', '}', ']', _VALUE_END) or last_nonspace.isdigit()):
+                out.append(",")
+
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                stack.append(ch)
+            elif ch in "}]":
+                if stack:
+                    stack.pop()
+                if not stack:
+                    closed = True
+                    i += 1
                     break
-        if end != -1:
-            return stripped[start:end + 1]
+            if ch not in " \t\r\n":
+                last_nonspace = ch
+            i += 1
+
+        # Smaller/local models frequently leave a trailing comma before a
+        # closing bracket (e.g. after the last item in an "options" list).
+        # Python's json.loads rejects this with a confusing "Expecting
+        # value" error rather than flagging the comma itself, so strip
+        # trailing commas here rather than letting every caller special-case it.
+        candidate = _re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+        if closed:
+            return candidate
+
+        # Reached end of text with brackets still open: the model was cut off
+        # before finishing (e.g. hit its output token limit partway through a
+        # multi-question response). Close out whatever's left open and return
+        # a best-effort candidate covering all the fully-formed data received
+        # so far, rather than handing the caller an unparseable fragment.
+        repaired = candidate.rstrip()
+        repaired = _re.sub(r",\s*$", "", repaired)
+        if in_string:
+            repaired += '"'
+        closers = {"{": "}", "[": "]"}
+        repaired += "".join(closers[b] for b in reversed(stack))
+        return repaired
 
     # Fallback: if no valid brace pair was found, return the stripped string
     # as-is so the caller receives the original content for error reporting.
@@ -550,7 +707,11 @@ def stream_github_llm(prompt: str, api_key: str) -> Generator[str, None, None]:
         "messages": messages,
         "stream": True,
         "temperature": 1,
-        "max_tokens": 4096,
+        # 4096 was too tight for multi-question JSON responses (e.g. a
+        # 10-question multiple-choice quiz with options + explanations) -
+        # GPT-4o would hit the cap mid-object, producing truncated JSON that
+        # fails to parse. Raised to give room for larger structured outputs.
+        "max_tokens": 16384,
         "top_p": 1
     }
     
@@ -607,7 +768,9 @@ def generate_github_response(prompt: str, api_key: str) -> str:
         "messages": messages,
         "stream": False,
         "temperature": 1,
-        "max_tokens": 4096,
+        # Matches the cap raised in stream_github_llm() above - 4096 could
+        # truncate large structured JSON responses (e.g. multi-question quizzes).
+        "max_tokens": 16384,
         "top_p": 1
     }
     

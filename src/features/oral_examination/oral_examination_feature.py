@@ -44,7 +44,9 @@ from src.features.exam_grading.exam_grading_feature import create_grading_prompt
 from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
     get_proctor_summary_by_user_assessment,
+    get_proctor_frames_by_user_assessment,
     get_proctor_webcam_summary_by_user_assessment,
+    get_proctor_webcam_frames_by_user_assessment,
     get_proctor_keystrokes_by_user_assessment,
     format_keystrokes_for_display,
     get_proctor_mouse_events_by_user_assessment,
@@ -909,6 +911,14 @@ def _render_oral_exam_grading(assessment_id: int) -> None:
                     f"Screen share: {share_label}"
                 )
 
+                frames = get_proctor_frames_by_user_assessment(student_id, assessment_id)
+                if frames:
+                    with st.expander(f"📷 Screen Capture Frames ({len(frames)})", expanded=False):
+                        frame_cols = st.columns(4)
+                        for i, frame in enumerate(frames):
+                            with frame_cols[i % 4]:
+                                st.image(frame["file_path"], caption=str(frame["captured_at"]))
+
                 webcam_proctor = get_proctor_webcam_summary_by_user_assessment(student_id, assessment_id)
                 webcam_label = {
                     "granted": "✅ granted", "denied": "❌ denied", None: "— not recorded",
@@ -925,6 +935,24 @@ def _render_oral_exam_grading(assessment_id: int) -> None:
                     f"{webcam_proctor['multiple_faces_count']} multiple-faces, "
                     f"{webcam_proctor['looking_away_count']} looking-away (eye movement) frame(s)"
                 )
+
+                webcam_frames = get_proctor_webcam_frames_by_user_assessment(student_id, assessment_id)
+                if webcam_frames:
+                    with st.expander(f"📷 Webcam Capture Frames ({len(webcam_frames)})", expanded=False):
+                        webcam_cols = st.columns(4)
+                        for i, frame in enumerate(webcam_frames):
+                            flags = []
+                            if frame["no_face"]:
+                                flags.append("no face")
+                            if frame["multiple_faces"]:
+                                flags.append(f"{frame['face_count']} faces")
+                            if frame["looking_away"]:
+                                flags.append("looking away")
+                            caption = str(frame["captured_at"])
+                            if flags:
+                                caption += " — ⚠️ " + ", ".join(flags)
+                            with webcam_cols[i % 4]:
+                                st.image(frame["file_path"], caption=caption)
 
                 keystrokes = get_proctor_keystrokes_by_user_assessment(student_id, assessment_id)
                 if keystrokes:

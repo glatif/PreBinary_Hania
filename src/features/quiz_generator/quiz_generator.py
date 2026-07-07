@@ -132,13 +132,34 @@ def parse_quiz_response(response: str) -> Dict[str, Any]:
     # If the LLM layer returned an error string (e.g. from a Groq rate-limit
     # or network failure), surface it directly rather than attempting to parse
     # it as JSON. Error strings from stream_llm always begin with "Error:".
-    if not response or response.lstrip().startswith("Error:"):
-        return {"error": response.strip() if response else "Empty response from model"}
+    # Use the stripped response for this check (not the raw one) so a
+    # whitespace-only response - e.g. "\n\n" - is also treated as empty
+    # instead of falling through to json.loads() and raising a cryptic
+    # "Expecting value: line 1 column 1" error.
+    stripped_response = response.strip() if response else ""
+    if not stripped_response or stripped_response.startswith("Error:"):
+        return {"error": stripped_response or "Empty response from model"}
 
     try:
-        # strip_llm_json extracts the outermost JSON object via brace-matching,
+        # strip_llm_json extracts the outermost JSON object via bracket-matching,
         # handling bare JSON, fenced JSON, and responses with surrounding prose.
-        quiz_data = json.loads(strip_llm_json(response))
+        cleaned = strip_llm_json(response)
+
+        # Some thinking models (e.g. DeepSeek) can get cut off before ever
+        # emitting the JSON object, and some responses are pure refusal/prose
+        # text that happens to contain a stray "{" (e.g. quoting code or math
+        # notation) without ever containing real JSON. strip_llm_json cannot
+        # find a balanced object in either case and falls back to returning
+        # the raw text untouched, so checking for "{" anywhere in the string
+        # isn't enough - a validly extracted candidate always *starts* with
+        # "{". Detect the failure here so the error names the actual problem
+        # (and shows what the model said) instead of a generic JSON parse
+        # failure pointing at line 1 column 1.
+        if not cleaned.strip().startswith("{"):
+            snippet = response.strip()[:300]
+            return {"error": f"Model response did not contain valid JSON. Response started with: {snippet!r}"}
+
+        quiz_data = json.loads(cleaned)
 
         # Validate the top-level structure.
         if "questions" not in quiz_data:
@@ -148,15 +169,41 @@ def parse_quiz_response(response: str) -> Dict[str, Any]:
         if not isinstance(questions, list):
             return {"error": "'questions' field must be a list"}
 
-        # Validate each question has the required fields.
-        for i, question in enumerate(questions):
-            required_fields = ["question_text", "question_type", "correct_answer"]
-            for field in required_fields:
-                if field not in question:
-                    return {"error": f"Question {i+1} missing required field: {field}"}
+        # Validate each question has the required fields. A response that got
+        # cut off mid-generation (e.g. hit the model's output token limit)
+        # produces a trailing question missing some fields even after
+        # strip_llm_json's truncation repair closes the JSON structurally -
+        # drop only the incomplete ones rather than failing the whole batch,
+        # so a truncated 10-question response still yields the 8 that
+        # finished instead of nothing at all.
+        # Check truthiness, not just presence: a truncated/repaired trailing
+        # question can end up with e.g. "correct_answer": "" - the key exists
+        # but is empty, which validate_quiz_data() (a stricter, separate check
+        # downstream in quiz_generator_feature.py) rejects for the *entire*
+        # combined multi-type batch. Filtering on emptiness here, in the same
+        # place questions are already being dropped for missing fields, keeps
+        # the two checks consistent and avoids losing an otherwise-good batch
+        # over one incomplete trailing question.
+        required_fields = ["question_text", "question_type", "correct_answer"]
+        valid_questions = [q for q in questions if all(q.get(f) for f in required_fields)]
 
+        if not valid_questions:
+            return {"error": "No complete questions could be parsed from the model response (it may have been cut off before finishing)"}
+
+        quiz_data["questions"] = valid_questions
         return quiz_data
 
+    except json.JSONDecodeError as e:
+        # A bare line/column number isn't actionable on its own - show the
+        # actual text around the failure point so the real cause (an
+        # unescaped character, a missing comma, etc.) is visible immediately
+        # instead of requiring another round of guessing from a position number.
+        context_start = max(0, e.pos - 80)
+        context_end = min(len(e.doc), e.pos + 80)
+        context = e.doc[context_start:context_end]
+        pointer_offset = e.pos - context_start
+        pointer = " " * pointer_offset + "^"
+        return {"error": f"Could not parse quiz response: {e.msg} at line {e.lineno} column {e.colno}\n...{context}...\n{' ' * 3}{pointer}"}
     except Exception as e:
         return {"error": f"Could not parse quiz response: {str(e)}"}
 
@@ -182,18 +229,31 @@ def generate_quiz_questions(content: str, question_type: str, num_questions: int
         prompt = create_quiz_generation_prompt(
             content, question_type, num_questions, difficulty, topic_filters
         )
-        
-        # Generate response using the LLM
-        full_response = ""
-        for text_chunk in stream_llm(prompt, model_id):
-            full_response += text_chunk
-        
-        # Parse the response
-        quiz_data = parse_quiz_response(full_response)
-        
+
+        # Weaker/local models occasionally ignore the "respond with ONLY
+        # valid JSON" instruction entirely and write a plain-text numbered
+        # list instead (e.g. "1. Which... - Option A: ...") - no amount of
+        # JSON repair can recover that, since there's no JSON to repair. This
+        # is usually a one-off rather than a persistent failure, so retry a
+        # few times before giving up, same as the proven fix already used in
+        # oral_examination_feature.py for the same failure mode. Deliberately
+        # NOT using force_json/Ollama's native JSON mode here - that was
+        # already tried for this exact quiz-generation use case and found to
+        # truncate output to a single question (see the detailed note in
+        # oral_examination_feature.py's question-generation call).
+        quiz_data = {"error": "No attempts were made"}
+        for _attempt in range(3):
+            full_response = ""
+            for text_chunk in stream_llm(prompt, model_id):
+                full_response += text_chunk
+
+            quiz_data = parse_quiz_response(full_response)
+            if "error" not in quiz_data:
+                break
+
         if "error" in quiz_data:
             return quiz_data
-        
+
         # Add metadata
         quiz_data["metadata"] = {
             "question_type": question_type,
@@ -203,9 +263,9 @@ def generate_quiz_questions(content: str, question_type: str, num_questions: int
             "model_used": model_id,
             "content_length": len(content)
         }
-        
+
         return quiz_data
-        
+
     except Exception as e:
         return {"error": f"Failed to generate quiz: {str(e)}"}
 
