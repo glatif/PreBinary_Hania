@@ -470,13 +470,18 @@ CREATE TABLE exam_grading_results (
     assessment_id       INT          NULL,
     student_name        VARCHAR(255),
     student_id_parsed   VARCHAR(100),
-    questions_text      TEXT,
-    rubric              TEXT,
-    sub_rubric          TEXT,
+    -- MEDIUMTEXT rather than TEXT (65,535-byte cap) because GitHub Models'
+    -- max_tokens is set to 16384 specifically to avoid truncating long,
+    -- multi-question grading responses (see llm_utils.py) — detailed_explanation
+    -- stores that raw response in the JSON-parse-failure fallback path and can
+    -- legitimately exceed TEXT's limit for a long exam.
+    questions_text      MEDIUMTEXT,
+    rubric              MEDIUMTEXT,
+    sub_rubric          MEDIUMTEXT,
     score               FLOAT,
     max_points          INT,
-    feedback            TEXT,
-    detailed_explanation TEXT,
+    feedback            MEDIUMTEXT,
+    detailed_explanation MEDIUMTEXT,
     model_provider      VARCHAR(100),
     model_name          VARCHAR(100),
     graded_at           TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
@@ -775,6 +780,328 @@ CREATE TABLE quiz_proctor_keystrokes (
     FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
     INDEX idx_proctor_keystroke_session (session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 23B. QUIZ PROCTOR MOUSE EVENTS
+-- =============================================================================
+-- Mouse activity captured the same way as quiz_proctor_keystrokes — buffered
+-- client-side and flushed in batches (see MOUSE_FLUSH_INTERVAL_MS in
+-- proctoring_feature.py) rather than one row per event. events_json holds
+-- one JSON array of {"type": "move"|"click"|"leave_window"|"enter_window",
+-- "x", "y", "button", "t"} objects per batch (x/y/button only present on
+-- "move"/"click" entries). Movement is sampled at most once every
+-- MOUSE_MOVE_SAMPLE_MS rather than logged on every native mousemove event,
+-- which fires far too often to record in full. Same session_id/user_id/
+-- quiz_id/assessment_id linkage as the other quiz_proctor_* tables.
+
+CREATE TABLE quiz_proctor_mouse_events (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    session_id    VARCHAR(36)  NOT NULL,
+    user_id       INT          NOT NULL,
+    quiz_id       INT          NULL,
+    assessment_id INT          NULL,
+    events_json   LONGTEXT     NOT NULL,
+    captured_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_mouse_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 24. QUIZ PROCTOR WEBCAM FRAMES
+-- =============================================================================
+-- Periodic webcam snapshots, captured client-side by proctoring_feature.py
+-- once a student grants camera permission, alongside the same session_id/
+-- user_id/quiz_id/assessment_id linkage as quiz_proctor_events/_frames/
+-- _keystrokes. Parallel to quiz_proctor_frames (screen-share snapshots) but
+-- with each frame additionally run through a face/gaze analysis pass:
+-- face_count/no_face/multiple_faces come from mediapipe FaceMesh detection.
+-- looking_away is true if EITHER of two signals crosses its threshold (see
+-- analyze_webcam_frame() in proctoring_feature.py): yaw_deg/pitch_deg, a
+-- solvePnP head-pose estimate against an uncalibrated camera matrix (a
+-- coarse signal that underestimates real rotation), or gaze_offset_x/
+-- gaze_offset_y, a calibration-free ratio of how far the iris has drifted
+-- from the center of the eye socket (the primary signal — also catches
+-- glances where the head barely moves but the eyes do). All five are NULL
+-- whenever face_count != 1 (none of this is estimable with zero or more
+-- than one face in frame).
+--
+-- Like quiz_proctor_frames, this is NOT continuous video — frames are
+-- captured at a fixed interval (see CAMERA_CAPTURE_INTERVAL_MS in
+-- proctoring_feature.py). Deleting a row here does not delete the file on
+-- disk; only the DB record cascades away with the user/quiz/assessment it
+-- references. Image files live under uploads/proctor_webcam_frames/.
+--
+-- The face/gaze analysis columns (face_count/no_face/multiple_faces/
+-- looking_away/yaw_deg/pitch_deg/gaze_offset_x/gaze_offset_y) are no longer
+-- populated at capture time — analysis_status starts 'pending' (with those
+-- columns zeroed/NULL) and is flipped to 'analyzed', with the real values
+-- filled in, by process_pending_proctor_webcam_frames() in
+-- proctoring_feature.py, deferring the mediapipe FaceMesh inference out of
+-- the live monitoring loop until an admin/scheduler runs it.
+
+CREATE TABLE quiz_proctor_webcam_frames (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    session_id      VARCHAR(36)  NOT NULL,
+    user_id         INT          NOT NULL,
+    quiz_id         INT          NULL,
+    assessment_id   INT          NULL,
+    file_path       VARCHAR(500) NOT NULL,
+    face_count      INT          NOT NULL,
+    no_face         TINYINT(1)   NOT NULL,
+    multiple_faces  TINYINT(1)   NOT NULL,
+    looking_away    TINYINT(1)   NULL,
+    yaw_deg         FLOAT        NULL,
+    pitch_deg       FLOAT        NULL,
+    gaze_offset_x   FLOAT        NULL,
+    gaze_offset_y   FLOAT        NULL,
+    analysis_status ENUM('pending', 'analyzed') NOT NULL DEFAULT 'pending',
+    captured_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_webcam_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 24B. QUIZ PROCTOR AUDIO CLIPS
+-- =============================================================================
+-- Audio clips captured client-side by proctoring_feature.py once a student
+-- grants microphone permission, same session_id/user_id/quiz_id/
+-- assessment_id linkage as the other quiz_proctor_* tables. Unlike the
+-- screen/webcam frame tables, every fixed-length segment is written here
+-- (as analysis_status = 'pending', with placeholder 0.0 durations) at
+-- capture time — the Silero VAD voice-activity analysis that decides
+-- whether a segment actually contains human speech is deferred to
+-- process_pending_proctor_audio_clips() in proctoring_feature.py, which
+-- deletes the row/file for segments with no detected speech and flips the
+-- rest to analysis_status = 'analyzed' with their real speech_duration_sec/
+-- clip_duration_sec filled in. So once processed, a row existing at all
+-- (with analysis_status = 'analyzed') still means speech was heard during
+-- that stretch of the exam, same as before — only the timing of that
+-- decision moved from capture time to a later on-demand/scheduled pass.
+-- Audio files live under uploads/proctor_audio_clips/.
+
+CREATE TABLE quiz_proctor_audio_clips (
+    id                  INT AUTO_INCREMENT PRIMARY KEY,
+    session_id          VARCHAR(36)  NOT NULL,
+    user_id             INT          NOT NULL,
+    quiz_id             INT          NULL,
+    assessment_id       INT          NULL,
+    file_path           VARCHAR(500) NOT NULL,
+    speech_duration_sec FLOAT        NOT NULL,
+    clip_duration_sec   FLOAT        NOT NULL,
+    analysis_status     ENUM('pending', 'analyzed') NOT NULL DEFAULT 'pending',
+    captured_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_audio_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 24b. PROCTORING - VIDEO SEGMENTS (full-session screen/webcam recording)
+-- =============================================================================
+-- One row per recorded segment (see save_proctor_video_segment() /
+-- VIDEO_SEGMENT_INTERVAL_MS in proctoring_feature.py) — kind distinguishes
+-- the screen recording from the webcam(+microphone) recording.
+-- get_or_build_proctor_video() stitches a session's segments together into
+-- one playable video on demand; this table only tracks the raw per-segment
+-- files, not the stitched output.
+
+CREATE TABLE quiz_proctor_video_segments (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    session_id    VARCHAR(36)  NOT NULL,
+    user_id       INT          NOT NULL,
+    quiz_id       INT          NULL,
+    assessment_id INT          NULL,
+    kind          ENUM('screen', 'webcam') NOT NULL,
+    seq           INT          NOT NULL,
+    file_path     VARCHAR(500) NOT NULL,
+    captured_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_video_segments_session (session_id, kind, seq)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 25. VERIFICATION ATTEMPTS
+-- =============================================================================
+-- Audit log of every identity-verification attempt made through the
+-- exam_verification feature (verify_student_identity() in
+-- exam_verification_feature.py), one row per attempt regardless of outcome.
+--
+-- document_type is auto-detected by detect_document_type() from keywords in
+-- the OCR text: student_card (institution ID — the only type a roll number
+-- check applies to), bc_drivers_licence, bc_services_card_or_bcid, or the
+-- generic other_gov_id (passport, other provinces' licences, ...).
+--
+-- expected_name / expected_roll_no are a snapshot of the student's profile
+-- fields (users.first_name/last_name/roll_no) at the time of the attempt, so
+-- the row stays meaningful even if the profile changes later. ocr_text is
+-- the raw text EasyOCR read off the ID document photo; name_matched/
+-- roll_matched record whether the expected name/roll number were found
+-- inside it (roll_matched is NULL when the document type isn't
+-- student_card, or the student has no roll_no on file, and the check was
+-- skipped). expiry_date/expired come from check_expiry() — both NULL when
+-- the document type carries no expiry (student_card) or no date could be
+-- read off it. face_matched/face_distance/face_threshold/face_error mirror
+-- the dict returned by check_face_match(). passed is the overall gate
+-- verdict (name_matched AND roll check AND NOT expired AND face_matched).
+--
+-- id_card_image_path/selfie_image_path keep the actual ID-card and selfie
+-- photos captured during the attempt, not just the OCR/face-match metadata
+-- derived from them (see _save_verification_photo() in
+-- exam_verification_feature.py). Both are nullable since a photo write can
+-- fail without blocking verification itself.
+
+CREATE TABLE verification_attempts (
+    id                 INT AUTO_INCREMENT PRIMARY KEY,
+    user_id            INT          NOT NULL,
+    gate_key           VARCHAR(100) NOT NULL,
+    document_type      VARCHAR(40)  NOT NULL DEFAULT 'student_card',
+    expected_name      VARCHAR(101) NOT NULL,
+    expected_roll_no   VARCHAR(50)  NULL,
+    ocr_text           LONGTEXT     NULL,
+    id_card_image_path VARCHAR(500) NULL,
+    selfie_image_path  VARCHAR(500) NULL,
+    name_matched       TINYINT(1)   NOT NULL,
+    roll_matched       TINYINT(1)   NULL,
+    expiry_date        DATE         NULL,
+    expired            TINYINT(1)   NULL,
+    face_matched       TINYINT(1)   NOT NULL,
+    face_distance      FLOAT        NULL,
+    face_threshold     FLOAT        NULL,
+    face_error         VARCHAR(255) NULL,
+    passed             TINYINT(1)   NOT NULL,
+    created_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_verification_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 26. ORAL EXAM SETUPS
+-- =============================================================================
+-- One row per assessment: the teacher-defined/AI-generated question set (a
+-- JSON array, each item carrying question_number/question_text/
+-- time_limit_seconds), the grading rubric, and the default max points per
+-- question. See oral_examination_feature.py.
+
+CREATE TABLE oral_exam_setups (
+    id                      INT AUTO_INCREMENT PRIMARY KEY,
+    assessment_id           INT NOT NULL UNIQUE,
+    questions               TEXT NOT NULL,
+    rubric                  TEXT,
+    max_points_per_question INT NOT NULL DEFAULT 10,
+    set_by                  INT NOT NULL,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+    FOREIGN KEY (set_by)        REFERENCES users(id)       ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 27. ORAL EXAM RESPONSES
+-- =============================================================================
+-- One row per student per question answered (or skipped). audio_file_path
+-- is nullable and skipped defaults to 0 — a skipped question stores no
+-- recording at all, distinct from "answered but transcription failed"
+-- (which stores an "Error: ..." transcript with real audio still on disk).
+-- The unique key guards against a double-submit inserting two rows for the
+-- same question, which would otherwise let a single answer be graded twice.
+
+CREATE TABLE oral_exam_responses (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    session_id      VARCHAR(36)  NOT NULL,
+    assessment_id   INT          NOT NULL,
+    student_id      INT          NOT NULL,
+    question_number INT          NOT NULL,
+    question_text   TEXT         NOT NULL,
+    audio_file_path VARCHAR(500) NULL,
+    transcript      TEXT,
+    skipped         TINYINT(1)   NOT NULL DEFAULT 0,
+    answered_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+    FOREIGN KEY (student_id)    REFERENCES users(id)       ON DELETE CASCADE,
+    INDEX idx_oral_response_session (session_id),
+    UNIQUE KEY uq_oral_response_question (assessment_id, student_id, question_number)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 28. ORAL EXAM GRADING RESULTS
+-- =============================================================================
+-- One row per student per question per batch grading run, using the same
+-- grading logic as Exam Grading (create_grading_prompt() in
+-- exam_grading_feature.py). grading_session_id groups all rows from one
+-- "Grade All" run so the History tab can revisit a past run as a unit.
+
+CREATE TABLE oral_exam_grading_results (
+    id                   INT AUTO_INCREMENT PRIMARY KEY,
+    grading_session_id   VARCHAR(36)  NOT NULL,
+    graded_by            INT          NOT NULL,
+    assessment_id        INT          NOT NULL,
+    student_id           INT          NOT NULL,
+    student_name         VARCHAR(255),
+    question_number      INT          NOT NULL,
+    question_text        TEXT         NOT NULL,
+    transcript           TEXT,
+    score                FLOAT        NOT NULL,
+    max_points           INT          NOT NULL,
+    feedback             TEXT,
+    detailed_explanation TEXT,
+    model_provider       VARCHAR(50),
+    model_name           VARCHAR(100),
+    graded_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (graded_by)     REFERENCES users(id)       ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+    FOREIGN KEY (student_id)    REFERENCES users(id)       ON DELETE CASCADE,
+    INDEX idx_oral_grading_session (grading_session_id),
+    INDEX idx_oral_grading_student_assessment (student_id, assessment_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 29. ASSESSMENT ATTEMPT LOG
+-- =============================================================================
+-- Cross-feature activity log covering Oral Examination and Practice Quiz
+-- attempts end-to-end (started, question reached, timed out, submitted/
+-- completed) — not just identity verification (see verification_attempts
+-- above). Lets a teacher see students who opened an assessment but never
+-- finished it. See src/utils/attempt_log.py.
+
+CREATE TABLE assessment_attempt_log (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    user_id         INT          NOT NULL,
+    assessment_id   INT          NOT NULL,
+    feature_name    VARCHAR(50)  NOT NULL,
+    session_id      VARCHAR(36)  NULL,
+    event_type      VARCHAR(50)  NOT NULL,
+    question_number INT          NULL,
+    detail          TEXT         NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)       ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+    INDEX idx_attempt_log_lookup (assessment_id, feature_name, user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 
 -- =============================================================================
 -- DEMO DATA
