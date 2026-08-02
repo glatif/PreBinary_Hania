@@ -472,13 +472,18 @@ CREATE TABLE exam_grading_results (
     assessment_id       INT          NULL,
     student_name        VARCHAR(255),
     student_id_parsed   VARCHAR(100),
-    questions_text      TEXT,
-    rubric              TEXT,
-    sub_rubric          TEXT,
+    -- MEDIUMTEXT rather than TEXT (65,535-byte cap) because GitHub Models'
+    -- max_tokens is set to 16384 specifically to avoid truncating long,
+    -- multi-question grading responses (see llm_utils.py) — detailed_explanation
+    -- stores that raw response in the JSON-parse-failure fallback path and can
+    -- legitimately exceed TEXT's limit for a long exam.
+    questions_text      MEDIUMTEXT,
+    rubric              MEDIUMTEXT,
+    sub_rubric          MEDIUMTEXT,
     score               FLOAT,
     max_points          INT,
-    feedback            TEXT,
-    detailed_explanation TEXT,
+    feedback            MEDIUMTEXT,
+    detailed_explanation MEDIUMTEXT,
     model_provider      VARCHAR(100),
     model_name          VARCHAR(100),
     graded_at           TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
@@ -838,28 +843,103 @@ CREATE TABLE quiz_proctor_mouse_events (
 -- proctoring_feature.py). Deleting a row here does not delete the file on
 -- disk; only the DB record cascades away with the user/quiz/assessment it
 -- references. Image files live under uploads/proctor_webcam_frames/.
+--
+-- The face/gaze analysis columns (face_count/no_face/multiple_faces/
+-- looking_away/yaw_deg/pitch_deg/gaze_offset_x/gaze_offset_y) are no longer
+-- populated at capture time — analysis_status starts 'pending' (with those
+-- columns zeroed/NULL) and is flipped to 'analyzed', with the real values
+-- filled in, by process_pending_proctor_webcam_frames() in
+-- proctoring_feature.py, deferring the mediapipe FaceMesh inference out of
+-- the live monitoring loop until an admin/scheduler runs it.
 
 CREATE TABLE quiz_proctor_webcam_frames (
-    id             INT AUTO_INCREMENT PRIMARY KEY,
-    session_id     VARCHAR(36)  NOT NULL,
-    user_id        INT          NOT NULL,
-    quiz_id        INT          NULL,
-    assessment_id  INT          NULL,
-    file_path      VARCHAR(500) NOT NULL,
-    face_count     INT          NOT NULL,
-    no_face        TINYINT(1)   NOT NULL,
-    multiple_faces TINYINT(1)   NOT NULL,
-    looking_away   TINYINT(1)   NULL,
-    yaw_deg        FLOAT        NULL,
-    pitch_deg      FLOAT        NULL,
-    gaze_offset_x  FLOAT        NULL,
-    gaze_offset_y  FLOAT        NULL,
-    captured_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    session_id      VARCHAR(36)  NOT NULL,
+    user_id         INT          NOT NULL,
+    quiz_id         INT          NULL,
+    assessment_id   INT          NULL,
+    file_path       VARCHAR(500) NOT NULL,
+    face_count      INT          NOT NULL,
+    no_face         TINYINT(1)   NOT NULL,
+    multiple_faces  TINYINT(1)   NOT NULL,
+    looking_away    TINYINT(1)   NULL,
+    yaw_deg         FLOAT        NULL,
+    pitch_deg       FLOAT        NULL,
+    gaze_offset_x   FLOAT        NULL,
+    gaze_offset_y   FLOAT        NULL,
+    analysis_status ENUM('pending', 'analyzed') NOT NULL DEFAULT 'pending',
+    captured_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
     FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
     FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
     INDEX idx_proctor_webcam_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 24B. QUIZ PROCTOR AUDIO CLIPS
+-- =============================================================================
+-- Audio clips captured client-side by proctoring_feature.py once a student
+-- grants microphone permission, same session_id/user_id/quiz_id/
+-- assessment_id linkage as the other quiz_proctor_* tables. Unlike the
+-- screen/webcam frame tables, every fixed-length segment is written here
+-- (as analysis_status = 'pending', with placeholder 0.0 durations) at
+-- capture time — the Silero VAD voice-activity analysis that decides
+-- whether a segment actually contains human speech is deferred to
+-- process_pending_proctor_audio_clips() in proctoring_feature.py, which
+-- deletes the row/file for segments with no detected speech and flips the
+-- rest to analysis_status = 'analyzed' with their real speech_duration_sec/
+-- clip_duration_sec filled in. So once processed, a row existing at all
+-- (with analysis_status = 'analyzed') still means speech was heard during
+-- that stretch of the exam, same as before — only the timing of that
+-- decision moved from capture time to a later on-demand/scheduled pass.
+-- Audio files live under uploads/proctor_audio_clips/.
+
+CREATE TABLE quiz_proctor_audio_clips (
+    id                  INT AUTO_INCREMENT PRIMARY KEY,
+    session_id          VARCHAR(36)  NOT NULL,
+    user_id             INT          NOT NULL,
+    quiz_id             INT          NULL,
+    assessment_id       INT          NULL,
+    file_path           VARCHAR(500) NOT NULL,
+    speech_duration_sec FLOAT        NOT NULL,
+    clip_duration_sec   FLOAT        NOT NULL,
+    analysis_status     ENUM('pending', 'analyzed') NOT NULL DEFAULT 'pending',
+    captured_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_audio_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 24b. PROCTORING - VIDEO SEGMENTS (full-session screen/webcam recording)
+-- =============================================================================
+-- One row per recorded segment (see save_proctor_video_segment() /
+-- VIDEO_SEGMENT_INTERVAL_MS in proctoring_feature.py) — kind distinguishes
+-- the screen recording from the webcam(+microphone) recording.
+-- get_or_build_proctor_video() stitches a session's segments together into
+-- one playable video on demand; this table only tracks the raw per-segment
+-- files, not the stitched output.
+
+CREATE TABLE quiz_proctor_video_segments (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    session_id    VARCHAR(36)  NOT NULL,
+    user_id       INT          NOT NULL,
+    quiz_id       INT          NULL,
+    assessment_id INT          NULL,
+    kind          ENUM('screen', 'webcam') NOT NULL,
+    seq           INT          NOT NULL,
+    file_path     VARCHAR(500) NOT NULL,
+    captured_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id)       REFERENCES users(id)                   ON DELETE CASCADE,
+    FOREIGN KEY (quiz_id)       REFERENCES practice_quiz_generated(id) ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id)             ON DELETE CASCADE,
+    INDEX idx_proctor_video_segments_session (session_id, kind, seq)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

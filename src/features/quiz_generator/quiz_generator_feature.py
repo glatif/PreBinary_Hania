@@ -61,17 +61,22 @@ from src.features.quiz_generator.quiz_generator import (
     create_word_document_with_answers,
 )
 from src.features.exam_verification.exam_verification_feature import verify_student_identity
+from src.utils.attempt_log import log_attempt_event, get_incomplete_attempts
 from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
     get_proctor_summary,
     get_proctor_frames,
     get_proctor_webcam_summary,
     get_proctor_webcam_frames,
+    get_proctor_audio_summary,
+    get_proctor_audio_clips,
     get_proctor_keystrokes,
     format_keystrokes_for_display,
     get_proctor_mouse_events,
     format_mouse_events_for_display,
     delete_proctor_session,
+    get_or_build_proctor_video,
+    get_or_build_combined_proctor_video,
 )
 
 
@@ -848,15 +853,38 @@ def render_quiz_interface_tab() -> None:
             return
 
         # Proctoring starts the instant verification passes, before any quiz
-        # content is shown. The returned session_id is stamped onto the
-        # attempt row when it is saved in display_quiz_results() below.
-        assessment_ctx = st.session_state.get("practice_quiz_selected_assessment") or {}
-        st.session_state["quiz_proctor_session_id"] = render_proctor_monitor(
-            gate_key=gate_key,
-            user=user,
-            quiz_id=st.session_state.get("quiz_current_db_id"),
-            assessment_id=assessment_ctx.get("id"),
-        )
+        # content is shown, and stays mounted only while the quiz is still
+        # in progress — once quiz_submitted is True, this block is skipped
+        # entirely on the next rerun, so the underlying CCv2 components
+        # (screen share, webcam, mic, tab/keystroke/mouse monitors) are no
+        # longer rendered and release their streams instead of continuing to
+        # record while the student is just looking at their results. The
+        # session_id is captured in session_state below the first time this
+        # runs, so display_quiz_results() can still stamp it onto the saved
+        # attempt row after monitoring has stopped.
+        if not st.session_state.get("quiz_submitted"):
+            assessment_ctx = st.session_state.get("practice_quiz_selected_assessment") or {}
+            st.session_state["quiz_proctor_session_id"] = render_proctor_monitor(
+                gate_key=gate_key,
+                user=user,
+                quiz_id=st.session_state.get("quiz_current_db_id"),
+                assessment_id=assessment_ctx.get("id"),
+            )
+
+            # Logged once per gate (guarded so a rerun while the quiz is open
+            # doesn't write duplicate rows) — this is what makes a quiz the
+            # student opened but never submitted visible to the instructor
+            # via get_incomplete_attempts(), instead of leaving no trace at all.
+            started_logged_key = f"quiz_started_logged_{gate_key}"
+            if assessment_ctx.get("id") and not st.session_state.get(started_logged_key):
+                log_attempt_event(
+                    user_id=int(user["id"]),
+                    assessment_id=assessment_ctx["id"],
+                    feature_name="practice_quiz",
+                    event_type="started",
+                    session_id=st.session_state.get("quiz_proctor_session_id"),
+                )
+                st.session_state[started_logged_key] = True
 
     # Quiz metadata summary
     metadata = quiz_data.get("metadata", {})
@@ -1078,6 +1106,13 @@ def display_quiz_results(questions: List[Dict[str, Any]]) -> None:
                 proctor_session_id=st.session_state.get("quiz_proctor_session_id"),
             )
             st.session_state.quiz_attempt_saved = True
+            log_attempt_event(
+                user_id=user_id,
+                assessment_id=assessment_id,
+                feature_name="practice_quiz",
+                event_type="submitted",
+                session_id=st.session_state.get("quiz_proctor_session_id"),
+            )
         except Exception as exc:
             st.warning(f"Attempt could not be saved to the database: {exc}")
 
@@ -1268,6 +1303,17 @@ def render_instructor_attempts_tab(assessment_id: int) -> None:
     """
     st.header("👩\u200d🏫 Student Attempts")
 
+    # Attempts that were opened but never submitted — see attempt_log.py.
+    # Shown even when no student has submitted anything yet (an "everyone
+    # opened it and gave up" assessment is exactly the case this surfaces),
+    # so it renders before the early return below.
+    incomplete = get_incomplete_attempts(assessment_id, "practice_quiz")
+    if incomplete:
+        with st.expander(f"⚠️ Started but did not submit ({len(incomplete)})", expanded=False):
+            for row in incomplete:
+                name = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
+                st.caption(f"**{name}** — last activity {row['last_activity']}")
+
     attempts = get_all_attempts_for_assessment(assessment_id)
 
     if not attempts:
@@ -1362,23 +1408,110 @@ def render_instructor_attempts_tab(assessment_id: int) -> None:
                 f"{webcam_proctor['multiple_faces_count']} multiple-faces, "
                 f"{webcam_proctor['looking_away_count']} looking-away frame(s)"
             )
+            if webcam_proctor["pending_count"]:
+                st.caption(
+                    f"⏳ {webcam_proctor['pending_count']} frame(s) awaiting analysis — "
+                    "run \"Run Proctoring Analysis\" in Admin Panel → Maintenance."
+                )
             webcam_frames = get_proctor_webcam_frames(attempt.get("proctor_session_id"))
             if webcam_frames:
                 with st.expander(f"📷 Webcam Capture Frames ({len(webcam_frames)})", expanded=False):
                     webcam_cols = st.columns(4)
                     for i, frame in enumerate(webcam_frames):
                         flags = []
-                        if frame["no_face"]:
-                            flags.append("no face")
-                        if frame["multiple_faces"]:
-                            flags.append(f"{frame['face_count']} faces")
-                        if frame["looking_away"]:
-                            flags.append("looking away")
+                        if frame["analysis_status"] == "pending":
+                            flags.append("analysis pending")
+                        else:
+                            if frame["no_face"]:
+                                flags.append("no face")
+                            if frame["multiple_faces"]:
+                                flags.append(f"{frame['face_count']} faces")
+                            if frame["looking_away"]:
+                                flags.append("looking away")
                         caption = str(frame["captured_at"])
                         if flags:
                             caption += " — ⚠️ " + ", ".join(flags)
                         with webcam_cols[i % 4]:
                             st.image(frame["file_path"], caption=caption)
+
+            # Audio clips captured while the student had the quiz open, kept
+            # only for segments where analyze_audio_clip()'s Silero VAD model
+            # detected human speech — see save_proctor_audio_clip() in
+            # proctoring_feature.py. Analysis is deferred, so clip_count only
+            # reflects clips already processed; pending_count is how many
+            # captured segments are still waiting.
+            audio_proctor = get_proctor_audio_summary(attempt.get("proctor_session_id"))
+            audio_icon = "🔴" if audio_proctor["clip_count"] else "🟢"
+            st.write(
+                f"**Microphone:** {audio_icon} {audio_proctor['clip_count']} clip(s) with "
+                f"detected speech, {audio_proctor['speech_duration_sec']:.1f}s total"
+            )
+            if audio_proctor["pending_count"]:
+                st.caption(
+                    f"⏳ {audio_proctor['pending_count']} segment(s) awaiting analysis — "
+                    "run \"Run Proctoring Analysis\" in Admin Panel → Maintenance."
+                )
+            audio_clips = get_proctor_audio_clips(attempt.get("proctor_session_id"))
+            if audio_clips:
+                with st.expander(f"🎙️ Audio Clips With Detected Speech ({len(audio_clips)})", expanded=False):
+                    for clip in audio_clips:
+                        st.audio(clip["file_path"])
+                        st.caption(
+                            f"{clip['captured_at']} — {clip['speech_duration_sec']:.1f}s speech "
+                            f"of {clip['clip_duration_sec']:.1f}s segment"
+                        )
+
+            # Full-session screen/webcam(+audio) recordings, stitched from
+            # segments uploaded throughout the attempt — see
+            # save_proctor_video_segment()/get_or_build_proctor_video() in
+            # proctoring_feature.py. Stitching runs ffmpeg, so it's built on
+            # request (button click) rather than on every render of this
+            # attempt row, and the resulting path is cached in
+            # session_state so reopening this page doesn't re-invoke ffmpeg.
+            proctor_session_id = attempt.get("proctor_session_id")
+            if proctor_session_id:
+                # Combined session recording — screen as the base with the
+                # webcam composited on top as a small picture-in-picture
+                # overlay, carrying the webcam's audio track (see
+                # get_or_build_combined_proctor_video() in
+                # proctoring_feature.py for the sync caveats). This is the
+                # one file most reviewers want; the separate screen/webcam
+                # players below stay available for closer inspection of
+                # either feed on its own.
+                combined_cache_key = f"proctor_video_combined_{proctor_session_id}"
+                with st.expander("🎬 Combined Session Recording (Screen + Webcam PiP + Audio)", expanded=False):
+                    cached_combined = st.session_state.get(combined_cache_key)
+                    if cached_combined:
+                        st.video(str(cached_combined))
+                    elif st.button("Load Combined Recording", key=f"load_{combined_cache_key}"):
+                        with st.spinner("Building combined recording..."):
+                            built_combined = get_or_build_combined_proctor_video(proctor_session_id)
+                        if built_combined:
+                            st.session_state[combined_cache_key] = built_combined
+                            st.video(str(built_combined))
+                        else:
+                            st.caption("No recording available for this session yet.")
+
+                for kind, label, icon in (
+                    ("screen", "Full Screen Recording", "🖥️"),
+                    ("webcam", "Full Webcam + Audio Recording", "🎥"),
+                ):
+                    cache_key = f"proctor_video_{kind}_{proctor_session_id}"
+                    with st.expander(f"{icon} {label}", expanded=False):
+                        # Only a successful build is cached — a None result
+                        # (no segments yet, or a transient ffmpeg failure)
+                        # must not get stuck forever with no retry option.
+                        cached_path = st.session_state.get(cache_key)
+                        if cached_path:
+                            st.video(str(cached_path))
+                        elif st.button(f"Load {label}", key=f"load_{cache_key}"):
+                            with st.spinner(f"Building {label.lower()}..."):
+                                built_path = get_or_build_proctor_video(proctor_session_id, kind)
+                            if built_path:
+                                st.session_state[cache_key] = built_path
+                                st.video(str(built_path))
+                            else:
+                                st.caption("No recording available for this session yet.")
 
             # Keys pressed while the student had the quiz open, flushed in
             # batches every KEYSTROKE_FLUSH_INTERVAL_MS — see
@@ -1574,15 +1707,15 @@ def _dialog_delete_quiz_attempt(attempt_id: int) -> None:
 def _dialog_delete_proctor_session(session_id: str) -> None:
     """
     Confirmation modal for an instructor permanently deleting the tab-switch
-    events, screen-capture frames, webcam frames, keystroke logs, and mouse
-    activity logs tied to one quiz attempt's proctoring session — the
-    attempt and its score are unaffected.
+    events, screen-capture frames, webcam frames, keystroke logs, mouse
+    activity logs, and speech-positive audio clips tied to one quiz
+    attempt's proctoring session — the attempt and its score are unaffected.
     """
     st.warning(
         "Are you sure you want to delete the tab-switch/focus events, "
-        "screen-capture frames, webcam frames, keystroke logs, and mouse "
-        "activity logs recorded for this attempt? The attempt and its score "
-        "are not affected. This cannot be undone."
+        "screen-capture frames, webcam frames, keystroke logs, mouse "
+        "activity logs, and audio clips recorded for this attempt? The "
+        "attempt and its score are not affected. This cannot be undone."
     )
     col1, col2 = st.columns(2)
     if col1.button("Delete", type="primary", key="proctor_dialog_confirm_delete"):

@@ -35,13 +35,22 @@
 
 import re
 import difflib
+import uuid
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import streamlit as st
 from PIL import Image
 
 from db import get_connection
+
+# Verification photos are kept independent of the course/assessment file
+# tree used elsewhere (auth.py's save_uploaded_file()) because this gate is
+# reached before any course/assessment file context is guaranteed to be in
+# scope for every caller — same self-contained Path("data") / ... approach
+# as _ORAL_QUESTION_AUDIO_DIR in oral_examination_feature.py.
+_VERIFICATION_PHOTO_DIR = Path("data") / "verification_photos"
 
 
 # =============================================================================
@@ -254,6 +263,32 @@ def check_face_match(id_card_image: Image.Image, selfie_image: Image.Image) -> d
 
 
 # =============================================================================
+# PHOTO STORAGE — keep the actual ID-card/selfie captures, not just the OCR/
+# face-match metadata derived from them
+# =============================================================================
+
+def _save_verification_photo(image: Image.Image, user_id, gate_key: str, label: str) -> str | None:
+    """
+    Write one verification photo (the ID card shot or the selfie) to disk
+    and return its relative path, or None on any failure.
+
+    Never raises — a disk write failure must not block identity
+    verification itself, mirroring _ensure_oral_question_audio()'s
+    try/except-None pattern in oral_examination_feature.py. The filename is
+    prefixed with a UUID (like auth.py's save_uploaded_file()) so concurrent
+    attempts by the same user for the same gate never collide.
+    """
+    try:
+        dest_dir = _VERIFICATION_PHOTO_DIR / gate_key
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / f"{user_id}_{uuid.uuid4().hex[:10]}_{label}.jpg"
+        image.convert("RGB").save(dest_path, format="JPEG", quality=90)
+        return str(dest_path)
+    except Exception:
+        return None
+
+
+# =============================================================================
 # AUDIT LOG — one row per verification attempt, pass or fail
 # =============================================================================
 
@@ -266,11 +301,15 @@ def _log_verification_attempt(
     face_result: dict,
     roll_check_applies: bool,
     passed: bool,
+    id_card_image_path: str | None = None,
+    selfie_image_path: str | None = None,
 ) -> None:
     """Persist this attempt to verification_attempts so every check on a
     student's identity (document type, name read off the card, roll/T-ID
     read off the card, expiry, and whether the face matched) is auditable
-    after the fact."""
+    after the fact — including the actual ID-card and selfie photos
+    (id_card_image_path/selfie_image_path), not just OCR/face-match
+    metadata derived from them."""
     expected_name = f"{student.get('first_name', '')} {student.get('last_name', '')}".strip()
 
     conn = get_connection()
@@ -280,9 +319,9 @@ def _log_verification_attempt(
             """
             INSERT INTO verification_attempts
                 (user_id, gate_key, document_type, expected_name, expected_roll_no,
-                 ocr_text, name_matched, roll_matched, expiry_date, expired,
-                 face_matched, face_distance, face_threshold, face_error, passed)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 ocr_text, id_card_image_path, selfie_image_path, name_matched, roll_matched,
+                 expiry_date, expired, face_matched, face_distance, face_threshold, face_error, passed)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 student.get("id"),
@@ -291,6 +330,8 @@ def _log_verification_attempt(
                 expected_name,
                 student.get("roll_no") or None,
                 text_result.get("ocr_text"),
+                id_card_image_path,
+                selfie_image_path,
                 text_result["name_ok"],
                 text_result["roll_ok"] if roll_check_applies else None,
                 expiry_result.get("expiry_date"),
@@ -350,6 +391,9 @@ def verify_student_identity(student: dict, gate_key: str) -> bool:
 
     id_card_image = Image.open(id_card_shot)
     selfie_image  = Image.open(selfie_shot)
+
+    id_card_image_path = _save_verification_photo(id_card_image, student.get("id"), gate_key, "id_card")
+    selfie_image_path  = _save_verification_photo(selfie_image, student.get("id"), gate_key, "selfie")
 
     with st.spinner("Reading ID document..."):
         ocr_text      = _extract_id_card_text(id_card_image)
@@ -414,6 +458,7 @@ def verify_student_identity(student: dict, gate_key: str) -> bool:
     _log_verification_attempt(
         student, gate_key, document_type, text_result, expiry_result,
         face_result, roll_check_applies, passed,
+        id_card_image_path=id_card_image_path, selfie_image_path=selfie_image_path,
     )
 
     if passed:

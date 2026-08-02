@@ -46,11 +46,15 @@ from src.features.proctoring.proctoring_feature import (
     get_proctor_frames_by_user_assessment,
     get_proctor_webcam_summary_by_user_assessment,
     get_proctor_webcam_frames_by_user_assessment,
+    get_proctor_audio_summary_by_user_assessment,
+    get_proctor_audio_clips_by_user_assessment,
     get_proctor_keystrokes_by_user_assessment,
     format_keystrokes_for_display,
     get_proctor_mouse_events_by_user_assessment,
     format_mouse_events_for_display,
     delete_proctor_data_for_user_assessment,
+    get_or_build_proctor_video_by_user_assessment,
+    get_or_build_combined_proctor_video_by_user_assessment,
 )
 
 try:
@@ -906,13 +910,14 @@ def _dialog_delete_entire_submission(
     Confirmation modal for permanently deleting everything associated with one
     student's exam submission: the submitted file (files row + file on disk)
     and all proctoring data for that student+assessment (tab-switch events,
-    screen/webcam frames, keystroke logs, mouse activity logs).
+    screen/webcam frames, keystroke logs, mouse activity logs, audio clips).
     """
     st.warning(
         f"Are you sure you want to delete **{file_name}** submitted by "
         f"**{student_name}**, together with all monitoring data (tab-switch "
-        f"events, screen/webcam frames, keystroke and mouse activity logs) "
-        f"recorded for this student across this assessment? This cannot be undone."
+        f"events, screen/webcam frames, keystroke and mouse activity logs, "
+        f"and audio clips) recorded for this student across this assessment? "
+        f"This cannot be undone."
     )
     col1, col2 = st.columns(2)
     if col1.button("Delete everything", type="primary", key="eg_full_dialog_confirm_delete"):
@@ -1345,23 +1350,118 @@ def exam_grading_ui() -> None:
                             f"{webcam_proctor['multiple_faces_count']} multiple-faces, "
                             f"{webcam_proctor['looking_away_count']} looking-away frame(s)"
                         )
+                        if webcam_proctor["pending_count"]:
+                            st.caption(
+                                f"⏳ {webcam_proctor['pending_count']} frame(s) awaiting analysis — "
+                                "run \"Run Proctoring Analysis\" in Admin Panel → Maintenance."
+                            )
                         webcam_frames = get_proctor_webcam_frames_by_user_assessment(row["uploaded_by"], assessment_id)
                         if webcam_frames:
                             with st.expander(f"📷 Webcam Capture Frames ({len(webcam_frames)})", expanded=False):
                                 webcam_cols = st.columns(4)
                                 for i, frame in enumerate(webcam_frames):
                                     flags = []
-                                    if frame["no_face"]:
-                                        flags.append("no face")
-                                    if frame["multiple_faces"]:
-                                        flags.append(f"{frame['face_count']} faces")
-                                    if frame["looking_away"]:
-                                        flags.append("looking away")
+                                    if frame["analysis_status"] == "pending":
+                                        flags.append("analysis pending")
+                                    else:
+                                        if frame["no_face"]:
+                                            flags.append("no face")
+                                        if frame["multiple_faces"]:
+                                            flags.append(f"{frame['face_count']} faces")
+                                        if frame["looking_away"]:
+                                            flags.append("looking away")
                                     caption = str(frame["captured_at"])
                                     if flags:
                                         caption += " — ⚠️ " + ", ".join(flags)
                                     with webcam_cols[i % 4]:
                                         st.image(frame["file_path"], caption=caption)
+
+                        # Audio clips captured between verification and
+                        # upload, kept only for segments where
+                        # analyze_audio_clip()'s Silero VAD model detected
+                        # human speech — see save_proctor_audio_clip() in
+                        # proctoring_feature.py. Analysis is deferred, so
+                        # clip_count only reflects clips already processed;
+                        # pending_count is how many captured segments are
+                        # still waiting.
+                        audio_proctor = get_proctor_audio_summary_by_user_assessment(row["uploaded_by"], assessment_id)
+                        audio_icon = "🔴" if audio_proctor["clip_count"] else "🟢"
+                        st.caption(
+                            f"{audio_icon} Microphone: {audio_proctor['clip_count']} clip(s) with "
+                            f"detected speech, {audio_proctor['speech_duration_sec']:.1f}s total"
+                        )
+                        if audio_proctor["pending_count"]:
+                            st.caption(
+                                f"⏳ {audio_proctor['pending_count']} segment(s) awaiting analysis — "
+                                "run \"Run Proctoring Analysis\" in Admin Panel → Maintenance."
+                            )
+                        audio_clips = get_proctor_audio_clips_by_user_assessment(row["uploaded_by"], assessment_id)
+                        if audio_clips:
+                            with st.expander(f"🎙️ Audio Clips With Detected Speech ({len(audio_clips)})", expanded=False):
+                                for clip in audio_clips:
+                                    st.audio(clip["file_path"])
+                                    st.caption(
+                                        f"{clip['captured_at']} — {clip['speech_duration_sec']:.1f}s speech "
+                                        f"of {clip['clip_duration_sec']:.1f}s segment"
+                                    )
+
+                        # Full-session screen/webcam(+audio) recordings,
+                        # stitched from segments uploaded across every
+                        # proctoring session this student had for this
+                        # assessment — see
+                        # get_or_build_proctor_video_by_user_assessment() in
+                        # proctoring_feature.py. Built on request (button
+                        # click) rather than on every render of this row,
+                        # cached in session_state so reopening this page
+                        # doesn't re-invoke ffmpeg.
+                        # Combined session recording — screen as the base
+                        # with the webcam composited on top as a small
+                        # picture-in-picture overlay, carrying the webcam's
+                        # audio track (see
+                        # get_or_build_combined_proctor_video_by_user_assessment()
+                        # in proctoring_feature.py). This is the one file
+                        # most reviewers want; the separate screen/webcam
+                        # players below stay available for closer
+                        # inspection of either feed.
+                        combined_cache_key = f"proctor_video_combined_user_{row['uploaded_by']}_assessment_{assessment_id}"
+                        with st.expander("🎬 Combined Session Recording (Screen + Webcam PiP + Audio)", expanded=False):
+                            cached_combined = st.session_state.get(combined_cache_key)
+                            if cached_combined:
+                                st.video(str(cached_combined))
+                            elif st.button("Load Combined Recording", key=f"load_{combined_cache_key}"):
+                                with st.spinner("Building combined recording..."):
+                                    built_combined = get_or_build_combined_proctor_video_by_user_assessment(
+                                        row["uploaded_by"], assessment_id
+                                    )
+                                if built_combined:
+                                    st.session_state[combined_cache_key] = built_combined
+                                    st.video(str(built_combined))
+                                else:
+                                    st.caption("No recording available for this student yet.")
+
+                        for kind, label, icon in (
+                            ("screen", "Full Screen Recording", "🖥️"),
+                            ("webcam", "Full Webcam + Audio Recording", "🎥"),
+                        ):
+                            cache_key = f"proctor_video_{kind}_user_{row['uploaded_by']}_assessment_{assessment_id}"
+                            with st.expander(f"{icon} {label}", expanded=False):
+                                # Only a successful build is cached — a None
+                                # result (no segments yet, or a transient
+                                # ffmpeg failure) must not get stuck forever
+                                # with no retry option.
+                                cached_path = st.session_state.get(cache_key)
+                                if cached_path:
+                                    st.video(str(cached_path))
+                                elif st.button(f"Load {label}", key=f"load_{cache_key}"):
+                                    with st.spinner(f"Building {label.lower()}..."):
+                                        built_path = get_or_build_proctor_video_by_user_assessment(
+                                            row["uploaded_by"], assessment_id, kind
+                                        )
+                                    if built_path:
+                                        st.session_state[cache_key] = built_path
+                                        st.video(str(built_path))
+                                    else:
+                                        st.caption("No recording available for this student yet.")
 
                         # Keys pressed between verification and upload,
                         # flushed in batches every KEYSTROKE_FLUSH_INTERVAL_MS
@@ -1552,6 +1652,18 @@ def exam_grading_ui() -> None:
                         student_answer=content,
                     )
 
+                    # Computing the grade (LLM call + JSON parsing) and persisting
+                    # it are two different failure domains, caught separately.
+                    # They used to share one except: below, which meant a DB
+                    # write failure (e.g. a value too long for a column) looked
+                    # identical to an LLM failure, and — because
+                    # save_exam_grading_result() was the last call before
+                    # graded_results.append() inside that same try: — either
+                    # kind of failure skipped the append AND the save, so the
+                    # student was shown live via the fallback error row below
+                    # but never written to exam_grading_results at all: they
+                    # silently vanished from the History tab with no
+                    # indication anything had gone wrong.
                     try:
                         response = generate_llm_response(prompt, selected_model, force_json=True)
 
@@ -1604,6 +1716,27 @@ def exam_grading_ui() -> None:
                         result_json["student_id"]         = student_id
                         result_json["grading_session_id"] = grading_session_id
 
+                    except Exception as e:
+                        st.error(f"Error grading {student_name}'s submission: {str(e)}")
+                        result_json = {
+                            "student_name":         student_name,
+                            "student_id":           student_id,
+                            "score":                0,
+                            "max_points":           st.session_state.max_points,
+                            "feedback":             f"Error: {str(e)}",
+                            "detailed_explanation": f"Failed to process submission: {str(e)}",
+                            "grading_session_id":   grading_session_id,
+                        }
+
+                    # Always attempt to persist, even the fallback/error result
+                    # above — a student who was actually graded (or who at
+                    # least got an attempt recorded) should always show up in
+                    # History, rather than only appearing when nothing went
+                    # wrong. A save failure here is reported explicitly instead
+                    # of being folded into the grading-error message above, so
+                    # it's clear this student's result exists on screen but did
+                    # NOT make it into the database.
+                    try:
                         save_exam_grading_result(
                             grading_session_id=grading_session_id,
                             graded_by=graded_by,
@@ -1619,19 +1752,13 @@ def exam_grading_ui() -> None:
                             detailed_explanation=result_json["detailed_explanation"],
                             model_name=selected_model,
                         )
-
-                        graded_results.append(result_json)
-
                     except Exception as e:
-                        st.error(f"Error grading {student_name}'s submission: {str(e)}")
-                        graded_results.append({
-                            "student_name":         student_name,
-                            "student_id":           student_id,
-                            "score":                0,
-                            "max_points":           st.session_state.max_points,
-                            "feedback":             f"Error: {str(e)}",
-                            "detailed_explanation": f"Failed to process submission: {str(e)}",
-                        })
+                        st.error(
+                            f"Graded {student_name}'s submission, but failed to save it to "
+                            f"the database — it will NOT appear in History. Details: {str(e)}"
+                        )
+
+                    graded_results.append(result_json)
 
                     completed_steps += 1
                     progress_bar.progress(completed_steps / total_steps)

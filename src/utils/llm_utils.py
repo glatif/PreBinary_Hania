@@ -40,6 +40,17 @@ import streamlit as st
 # generate_llm_response() for the DeepSeek and Llama 3.2 local models.
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
+# Every requests.post() call to an LLM/transcription provider in this file
+# passes this as its timeout. Without it, a stalled connection (unreachable
+# local Ollama server, a provider outage, a network drop) hangs forever with
+# no exception raised — since every call site here is wrapped in a
+# try/except requests.exceptions.RequestException, a timeout is what turns
+# an indefinite hang into a caught, displayable error instead. 120s is
+# generous enough for a slow multi-question structured JSON response (e.g.
+# Exam Grading's per-submission call) without leaving a caller stuck
+# indefinitely on a dead connection.
+LLM_REQUEST_TIMEOUT_SECONDS = 120
+
 # MODELS maps display names (shown in UI selectboxes) to internal model ID
 # strings. Model IDs are stored in the pref_model_* columns in the users table
 # and in each feature's session state key. Adding a new model requires a new
@@ -85,7 +96,7 @@ def stream_local_llm(prompt: str, model_name: str, api_url: str = OLLAMA_API_URL
     }
     
     try:
-        with requests.post(api_url, json=payload, stream=True) as response:
+        with requests.post(api_url, json=payload, stream=True, timeout=LLM_REQUEST_TIMEOUT_SECONDS) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if line:
@@ -124,7 +135,7 @@ def stream_groq_llm(prompt: str, api_key: str) -> Generator[str, None, None]:
     }
     
     try:
-        with requests.post(url, json=payload, headers=headers, stream=True) as response:
+        with requests.post(url, json=payload, headers=headers, stream=True, timeout=LLM_REQUEST_TIMEOUT_SECONDS) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if line:
@@ -132,11 +143,11 @@ def stream_groq_llm(prompt: str, api_key: str) -> Generator[str, None, None]:
                     line_str = line.decode('utf-8')
                     if not line_str or line_str == "data: [DONE]":
                         continue
-                    
+
                     # Remove the "data: " prefix
                     if line_str.startswith("data: "):
                         line_str = line_str[6:]
-                    
+
                     try:
                         json_data = json.loads(line_str)
                         if "choices" in json_data and len(json_data["choices"]) > 0:
@@ -178,7 +189,7 @@ def stream_openai_llm(prompt: str, api_key: str) -> Generator[str, None, None]:
     }
     
     try:
-        with requests.post(url, json=payload, headers=headers, stream=True) as response:
+        with requests.post(url, json=payload, headers=headers, stream=True, timeout=LLM_REQUEST_TIMEOUT_SECONDS) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if line:
@@ -186,11 +197,11 @@ def stream_openai_llm(prompt: str, api_key: str) -> Generator[str, None, None]:
                     line_str = line.decode('utf-8')
                     if not line_str or line_str == "data: [DONE]":
                         continue
-                    
+
                     # Remove the "data: " prefix
                     if line_str.startswith("data: "):
                         line_str = line_str[6:]
-                    
+
                     try:
                         json_data = json.loads(line_str)
                         if "choices" in json_data and len(json_data["choices"]) > 0:
@@ -226,7 +237,7 @@ def _transcribe_audio_openai_compatible(
     data = {"model": model}
 
     try:
-        response = requests.post(url, headers=headers, files=files, data=data)
+        response = requests.post(url, headers=headers, files=files, data=data, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
         return response.json().get("text", "")
     except requests.exceptions.RequestException as e:
@@ -244,8 +255,10 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
     error-handling path.
 
     Args:
-        audio_bytes: Raw audio file bytes (WAV, as produced by st.audio_input).
-        filename: Filename to forward to the transcription API.
+        audio_bytes: Raw audio file bytes — WAV (st.audio_input) or webm/mp4
+            (oral_examination_feature.py's MediaRecorder-based answer capture).
+        filename: Filename to forward to the transcription API; its extension
+            is how the API infers the audio format, so it must match audio_bytes.
 
     Returns:
         The transcript text, or an error string prefixed with 'Error:'.
@@ -533,7 +546,7 @@ def generate_llm_response(
             payload["format"] = "json"
 
         try:
-            response = requests.post(api_url, json=payload)
+            response = requests.post(api_url, json=payload, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             return response.json()["response"]
         except requests.exceptions.RequestException as e:
@@ -600,7 +613,7 @@ def generate_groq_response(prompt: str, api_key: str) -> str:
     }
     
     try:
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
         result = response.json()
         return result["choices"][0]["message"]["content"]
@@ -637,7 +650,7 @@ def generate_openai_response(prompt: str, api_key: str) -> str:
     }
     
     try:
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
         result = response.json()
         return result["choices"][0]["message"]["content"]
@@ -677,7 +690,7 @@ def generate_gemini_response(prompt: str, api_key: str) -> str:
     }
     
     try:
-        response = requests.post(endpoint, json=payload, headers=headers)
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
         result = response.json()
         return result["candidates"][0]["content"]["parts"][0]["text"]
@@ -721,7 +734,7 @@ def stream_github_llm(prompt: str, api_key: str) -> Generator[str, None, None]:
     }
     
     try:
-        with requests.post(url, json=payload, headers=headers, stream=True) as response:
+        with requests.post(url, json=payload, headers=headers, stream=True, timeout=LLM_REQUEST_TIMEOUT_SECONDS) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if line:
@@ -729,11 +742,11 @@ def stream_github_llm(prompt: str, api_key: str) -> Generator[str, None, None]:
                     line_str = line.decode('utf-8')
                     if not line_str or line_str == "data: [DONE]":
                         continue
-                    
+
                     # Remove the "data: " prefix
                     if line_str.startswith("data: "):
                         line_str = line_str[6:]
-                    
+
                     try:
                         json_data = json.loads(line_str)
                         if "choices" in json_data and len(json_data["choices"]) > 0:
@@ -780,7 +793,7 @@ def generate_github_response(prompt: str, api_key: str) -> str:
     }
     
     try:
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
         result = response.json()
         return result["choices"][0]["message"]["content"]
@@ -948,7 +961,7 @@ def _stream_openai_compatible_chat(
     }
 
     try:
-        with requests.post(url, json=payload, headers=headers, stream=True) as response:
+        with requests.post(url, json=payload, headers=headers, stream=True, timeout=LLM_REQUEST_TIMEOUT_SECONDS) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if line:
@@ -1032,6 +1045,7 @@ def _stream_gemini_chat(
             endpoint,
             json=payload,
             headers={"Content-Type": "application/json"},
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         result = response.json()
@@ -1070,7 +1084,7 @@ def _stream_ollama_chat(
     }
 
     try:
-        with requests.post(api_url, json=payload, stream=True) as response:
+        with requests.post(api_url, json=payload, stream=True, timeout=LLM_REQUEST_TIMEOUT_SECONDS) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if line:

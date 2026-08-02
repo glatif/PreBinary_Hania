@@ -133,7 +133,22 @@ opencv-python-headless
 mediapipe==0.10.9
 protobuf<4,>=3.11
 matplotlib
-sounddevice
+
+
+# ── Exam Proctoring — audio voice-activity monitoring ────────────────────────
+# silero-vad's pretrained speech-detection model (proctoring_feature.py's
+# analyze_audio_clip()) flags whether human speech is present in a recorded
+# audio clip. Its model file ships bundled inside the pip wheel (no torch.hub
+# download, no internet access needed at runtime) and loads as a torch JIT
+# module, so it reuses the torch==2.1.2 already pinned above instead of
+# adding a second DL runtime. torchaudio is a hard dependency of silero-vad
+# itself; pinned to 2.1.2 to match the paired torch release. Audio clips are
+# decoded from the browser's webm/opus recording via pydub (already used by
+# narrated_slideshow) rather than silero-vad's own torchaudio-based
+# read_audio(), so no new audio backend (ffmpeg/sox/soundfile) is needed
+# beyond the imageio-ffmpeg binary already pinned below for moviepy.
+silero-vad
+torchaudio==2.1.2
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────

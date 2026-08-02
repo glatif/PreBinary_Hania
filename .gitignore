@@ -49,6 +49,12 @@ uploads/
 grading_results.csv
 keys.txt
 
+# Runtime-generated proctoring/verification data — verification_photos holds
+# actual captured ID-card/selfie images (sensitive), question_audio is
+# regenerable TTS cache.
+data/oral_examination/
+data/verification_photos/
+
 # Data files (uncomment if you don't want to include data files in your repository)
 # data/
 # *.npy

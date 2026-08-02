@@ -22,94 +22,51 @@
 # =============================================================================
 # TORCH PATCH
 # =============================================================================
-# PyTorch's torch._classes module triggers a Streamlit file-watcher
-# compatibility error on startup. The patch below intercepts attribute access
-# on torch._classes before Streamlit's watcher initialises, preventing the
-# crash. It must appear before all other imports so it executes first.
+# Streamlit's file watcher walks every module in sys.modules and probes
+# __file__/__spec__/__path__ via hasattr() to find source paths to watch
+# (see get_module_paths() in streamlit/watcher/local_sources_watcher.py).
+# torch.classes (a torch._classes._Classes instance, registered under both
+# `torch.classes` and `torch._classes.classes`) overrides __getattr__ to look
+# up TorchScript classes by name, and raises RuntimeError — not
+# AttributeError — for the unregistered name "__path__". hasattr() only
+# swallows AttributeError, so that RuntimeError propagates and crashes the
+# app on startup. This is a known Streamlit/PyTorch interaction — see
+# https://github.com/streamlit/streamlit/issues/10992 — that Streamlit's own
+# partial guard (checking the type of __path__ once it's already been
+# fetched) doesn't prevent, since the crash happens on the fetch itself.
 #
-# This patch is required by the RAG and Advisor AI features, which depend on
-# sentence-transformers and FAISS, both of which import PyTorch.
-
-import os
-import sys
-import types
-import importlib.abc
+# Fix: assign a real, plain __path__ attribute directly onto the live
+# torch.classes object. Normal attribute lookup then finds it in the
+# instance's own __dict__ and never falls through to the crashing
+# __getattr__, while every other attribute on the object — notably
+# load_library(), which torchaudio calls to load its native ops extension —
+# is untouched. This must appear before all other imports so it executes
+# before Streamlit's watcher ever inspects sys.modules.
+#
+# An earlier version of this patch instead intercepted the *import* of
+# torch._classes/torch._classes.classes via a sys.meta_path finder and
+# replaced it with an empty stub module. That also silenced the crash, but
+# it replaced PyTorch's real torch.classes singleton everywhere in the
+# process — including its load_library method — which broke torchaudio
+# (needed by the proctoring feature's silero-vad speech detection) with
+# `AttributeError: module 'torch._classes.classes' has no attribute
+# 'load_library'`. The one-line fix below avoids that by patching the real
+# object in place instead of substituting a fake one.
+#
+# This patch is required by the RAG and Advisor AI features (sentence-
+# transformers, FAISS) and the proctoring feature's audio analysis
+# (torchaudio, silero-vad), all of which import PyTorch.
 
 try:
-    class _TorchClassesFinder(importlib.abc.MetaPathFinder):
-        """
-        MetaPathFinder that intercepts imports of torch._classes and its
-        submodules, replacing them with a stub module that exposes a no-op
-        __path__ attribute. This prevents Streamlit's file watcher from
-        raising an AttributeError when it inspects the module's __path__.
-        """
-        def find_spec(self, fullname, path, target=None):
-            if fullname == "torch._classes" or fullname.startswith("torch._classes."):
-                class _DummyPath:
-                    _path = []
-
-                class _DummyLoader(importlib.abc.Loader):
-                    def create_module(self, spec):
-                        module = types.ModuleType(fullname)
-                        module.__path__ = _DummyPath()
-                        return module
-
-                    def exec_module(self, module):
-                        pass
-
-                return importlib.machinery.ModuleSpec(
-                    name=fullname,
-                    loader=_DummyLoader(),
-                    is_package=True,
-                )
-            return None
-
-    sys.meta_path.insert(0, _TorchClassesFinder())
-
     import torch
-
-    class _DummyPath:
-        _path = []
-
-    if hasattr(torch, "_classes"):
-        if not hasattr(torch._classes, "__path__"):
-            torch._classes.__path__ = _DummyPath()
-
-        _original_getattr = getattr(torch._classes, "__getattr__", None)
-
-        def _safe_getattr(self, name=None):
-            if name is None or name == "__path__":
-                return _DummyPath()
-            if _original_getattr:
-                try:
-                    return _original_getattr(self, name)
-                except Exception:
-                    pass
-            raise AttributeError(
-                f"{self.__class__.__name__} has no attribute '{name}'"
-            )
-
-        torch._classes.__getattr__ = _safe_getattr
-
-        if hasattr(torch._C, "_get_custom_class_python_wrapper"):
-            _original_wrapper = torch._C._get_custom_class_python_wrapper
-
-            def _safe_wrapper(name=None, attr=None):
-                if name is None or attr is None or attr == "__path__":
-                    return _DummyPath()
-                try:
-                    return _original_wrapper(name, attr)
-                except Exception:
-                    return None
-
-            torch._C._get_custom_class_python_wrapper = _safe_wrapper
-
+    torch.classes.__path__ = []
 except Exception as _torch_patch_error:
     print(f"Warning: torch patch could not be applied: {_torch_patch_error}")
 
 
 import streamlit as st
 import pandas as pd
+from pathlib import Path
 from sqlalchemy import text
 
 from db import get_engine
@@ -156,7 +113,11 @@ from src.features.student_wellness.student_wellness_feature import student_welln
 from src.features.quiz_generator.quiz_generator_feature import quiz_generator_ui
 from src.features.oral_examination.oral_examination_feature import oral_examination_ui
 from src.features.narrated_slideshow.narrated_slideshow_feature import render_narrated_slideshow_feature
-from src.features.proctoring.proctoring_feature import cleanup_old_proctor_data
+from src.features.proctoring.proctoring_feature import (
+    cleanup_old_proctor_data,
+    process_pending_proctor_analysis,
+    start_proctor_analysis_scheduler,
+)
 
 # llm_utils.MODELS is referenced by the profile page to build per-feature model
 # preference selectors and to resolve stored model IDs back to display names.
@@ -283,6 +244,16 @@ st.markdown("""
 # UReap feature session state keys (slideshow_*, advisor_*, quiz_*, etc.) are
 # initialised by their own initialize_*_session_state() functions when each
 # feature page first renders. They are not listed here.
+
+# Starts the background proctoring-analysis sweep thread (see
+# start_proctor_analysis_scheduler() in proctoring_feature.py) — safe and
+# cheap to call on every rerun of every session, since @st.cache_resource
+# guarantees the thread itself only actually starts once per server process.
+# This is what makes deferred webcam/audio analysis (see
+# process_pending_proctor_analysis()) run on its own schedule, so results are
+# already there whenever an admin next opens the Grading Results / review
+# pages, rather than only after someone clicks "Run Proctoring Analysis".
+start_proctor_analysis_scheduler()
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -2151,6 +2122,7 @@ def _admin_verification_log_tab(engine):
             SELECT
                 va.id, va.user_id, u.username, va.gate_key, va.document_type,
                 va.expected_name, va.expected_roll_no, va.ocr_text,
+                va.id_card_image_path, va.selfie_image_path,
                 va.name_matched, va.roll_matched, va.expiry_date, va.expired,
                 va.face_matched, va.face_distance, va.face_threshold,
                 va.face_error, va.passed, va.created_at
@@ -2165,13 +2137,41 @@ def _admin_verification_log_tab(engine):
         st.info("No verification attempts have been recorded yet.")
         return
 
+    # The ID-card and selfie photos captured for each attempt (see
+    # _save_verification_photo() in exam_verification_feature.py) — picked
+    # by row id here since st.dataframe can't embed images inline. Rows
+    # logged before this feature existed have no path on file, so both
+    # sides fall back to "not available".
+    with st.expander("🖼️ View captured photos for an attempt", expanded=False):
+        photo_row_id = st.selectbox(
+            "Attempt ID",
+            options=df["id"].tolist(),
+            key="verification_photo_row_select",
+        )
+        photo_row = df.loc[df["id"] == photo_row_id].iloc[0]
+        photo_col1, photo_col2 = st.columns(2)
+        with photo_col1:
+            st.caption("ID Document")
+            id_card_path = photo_row.get("id_card_image_path")
+            if id_card_path and Path(id_card_path).exists():
+                st.image(id_card_path)
+            else:
+                st.caption("Not available for this attempt.")
+        with photo_col2:
+            st.caption("Selfie")
+            selfie_path = photo_row.get("selfie_image_path")
+            if selfie_path and Path(selfie_path).exists():
+                st.image(selfie_path)
+            else:
+                st.caption("Not available for this attempt.")
+
     document_type_labels = {
         "student_card": "Institution Student ID Card",
         "bc_drivers_licence": "BC Driver's Licence",
         "bc_services_card_or_bcid": "BC Services Card / BCID",
         "other_gov_id": "Other Canadian Government ID",
     }
-    display_df = df.drop(columns=["user_id"]).copy()
+    display_df = df.drop(columns=["user_id", "id_card_image_path", "selfie_image_path"]).copy()
     display_df["document_type"] = display_df["document_type"].map(document_type_labels).fillna(display_df["document_type"])
     display_df = display_df.rename(columns={
         "id": "ID",
@@ -2199,25 +2199,68 @@ def _admin_maintenance_tab():
     """
     Admin Panel → Maintenance tab.
 
-    Currently holds a single on-demand action: purge proctoring data (tab-
-    switch/focus-loss events, screen-capture frame files, webcam frame files,
-    keystroke logs, and mouse activity logs) older than a chosen retention
-    window. This app has no background worker or cron, so nothing deletes
-    this data unless an admin clicks the button here — see
-    cleanup_old_proctor_data() in proctoring_feature.py for what it does and
-    why this data is treated as short-lived in the first place.
+    Holds two actions:
+
+      1. Run Proctoring Analysis: process_pending_proctor_analysis() in
+         proctoring_feature.py — runs the CPU-heavy face/gaze (mediapipe)
+         and speech-detection (Silero VAD) analysis that capture time
+         deliberately skips, over every webcam frame/audio clip still
+         analysis_status = 'pending'. This now also runs automatically every
+         PROCTOR_ANALYSIS_SWEEP_INTERVAL_SECONDS via a background thread
+         (see start_proctor_analysis_scheduler(), started once at app
+         startup) — results are typically already waiting by the time an
+         admin opens a review page. The button here is for an immediate,
+         on-demand run instead of waiting for the next automatic sweep.
+      2. Run Proctoring Data Cleanup: purge proctoring data (tab-switch/
+         focus-loss events, screen-capture frame files, webcam frame files,
+         keystroke logs, mouse activity logs, speech-positive audio clips,
+         and full-session screen/webcam video segments) older than a chosen
+         retention window — see cleanup_old_proctor_data() for what it does
+         and why this data is treated as short-lived in the first place.
+         Unlike analysis above, this one is still manual/on-demand only —
+         this app has no background worker/cron of its own otherwise, so
+         nothing purges data unless an admin clicks the button (or an
+         external scheduler calls the same function directly).
     """
+    st.subheader("Proctoring Analysis")
+    st.write(
+        "Webcam frames and microphone segments are captured live during a "
+        "proctored session but their analysis (face/gaze detection, "
+        "speech detection) is deferred so it never competes for CPU with "
+        "the live monitoring itself. This now runs automatically in the "
+        "background every 15 minutes, so results are usually ready by the "
+        "time you check back — use the button below only if you want an "
+        "immediate run right now instead of waiting. Audio clips with no "
+        "detected speech are discarded at analysis time, exactly as they "
+        "always would have been, just later."
+    )
+    if st.button("Run Proctoring Analysis Now", type="primary"):
+        with st.spinner("Analyzing pending webcam frames and audio clips..."):
+            analysis_result = process_pending_proctor_analysis()
+        st.success(
+            f"Analyzed {analysis_result['webcam_frames_analyzed']} webcam frame(s) "
+            f"({analysis_result['webcam_frames_missing_file']} skipped, file missing); "
+            f"analyzed {analysis_result['audio_clips_analyzed']} audio clip(s) with "
+            f"detected speech, discarded {analysis_result['audio_clips_discarded']} "
+            f"with no speech detected "
+            f"({analysis_result['audio_clips_missing_file']} skipped, file missing)."
+        )
+
+    st.divider()
+
     st.subheader("Proctoring Data Cleanup")
     st.write(
         "Tab-switch/focus-loss events, screen-capture frames, webcam frames "
-        "(with their face/gaze analysis), keystroke logs, and mouse activity "
-        "logs recorded during proctored quizzes and exam submissions. "
-        "Deleting them also removes the captured frame images from disk."
+        "(with their face/gaze analysis), keystroke logs, mouse activity "
+        "logs, audio clips where speech was detected, and full-session "
+        "screen/webcam video recordings, recorded during proctored quizzes "
+        "and exam submissions. Deleting them also removes the captured "
+        "frame images, audio files, and video files from disk."
     )
     retention_days = st.number_input(
         "Delete proctoring data older than (days)",
         min_value=1, max_value=365, value=7,
-        help="Events, frames, keystroke logs, and mouse activity logs older than this many days will be permanently deleted.",
+        help="Events, frames, keystroke logs, mouse activity logs, audio clips, and video recordings older than this many days will be permanently deleted.",
     )
     if st.button("Run Proctoring Data Cleanup", type="primary"):
         with st.spinner("Cleaning up old proctoring data..."):
@@ -2227,8 +2270,10 @@ def _admin_maintenance_tab():
             f"{result['frames_deleted']} screen frame record(s), "
             f"{result['webcam_frames_deleted']} webcam frame record(s), "
             f"{result['keystrokes_deleted']} keystroke batch(es), "
-            f"{result['mouse_events_deleted']} mouse-event batch(es), and "
-            f"removed {result['files_removed']} image file(s) from disk."
+            f"{result['mouse_events_deleted']} mouse-event batch(es), "
+            f"{result['audio_clips_deleted']} audio clip record(s), "
+            f"{result['video_segments_deleted']} video segment record(s), and "
+            f"removed {result['files_removed']} image/audio/video file(s) from disk."
         )
 
 

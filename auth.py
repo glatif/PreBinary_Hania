@@ -49,13 +49,16 @@ UPLOAD_ROOT = Path("uploads")
 # .zip is included to support Exam Grading, which accepts a ZIP archive of
 # student PDF submissions. The ZIP is saved to disk before extraction so the
 # original submission bundle is preserved under the course/assessment directory.
-# .wav is included to support Oral Examination, which saves each student's
-# recorded answer (captured via st.audio_input, which produces WAV) to disk
-# alongside its transcript.
+# .wav/.webm/.mp4 are included to support Oral Examination, which saves each
+# student's recorded answer to disk alongside its transcript — .wav from the
+# legacy st.audio_input flow, .webm/.mp4 from the conversational Q&A
+# recorder's MediaRecorder output (see _ORAL_QA_RECORDER_JS in
+# oral_examination_feature.py; .mp4 is the fallback when a browser doesn't
+# support webm recording).
 ALLOWED_EXTENSIONS = {
     ".pdf", ".txt", ".png", ".jpg", ".jpeg",
     ".webp", ".md", ".html", ".json", ".xml", ".csv",
-    ".docx", ".pptx", ".zip", ".wav",
+    ".docx", ".pptx", ".zip", ".wav", ".webm", ".mp4",
 }
 
 
