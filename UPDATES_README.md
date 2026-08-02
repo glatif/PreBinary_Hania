@@ -30,9 +30,11 @@
 
 **10. Reliability Fixes** — Fixed a bug where long exam results could silently fail to save; save failures are now reported separately from grading failures; all LLM/transcription calls now timeout after 120s instead of hanging.
 
+**11. Database Schema** — `schema_clean.sql` and `schema_demo.sql` now create every table this update needs (oral exam, attempt log, verification photos, audio/video proctoring) directly, so a fresh database no longer requires running any `migration_add_*.sql` files by hand. `schema_demo.sql` was also brought up to date with older proctoring tables it had been missing.
+
 ## Setup needed before using
 
-- **Fresh server / new database:** just run `schema_clean.sql` (or `schema_demo.sql` for seeded demo accounts) as usual — every table from this update (oral exam, attempt log, verification photos, audio/video proctoring) is already baked in. You do **not** need to run any `migration_add_*.sql` files.
+- **Fresh server / new database:** just run `schema_clean.sql` (or `schema_demo.sql` for seeded demo accounts) as usual — everything is already included.
 - **Existing database you want to keep data in:** run the new `migration_add_*.sql` files instead of recreating the schema (`migration_add_proctor_analysis_status.sql` must run after `migration_add_audio_proctoring.sql`/`migration_add_video_proctoring.sql`, since it alters their tables).
 - Add a Groq or OpenAI key under **Profile → AI API Keys** for any account taking an oral exam.
 - If using the local model for oral exam questions, make sure Ollama is running with `deepseek-r1:1.5b` pulled.
