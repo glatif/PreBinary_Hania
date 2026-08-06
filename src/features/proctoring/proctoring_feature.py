@@ -38,7 +38,7 @@
 #     tab-switch events, and stitched into one playable video per session on
 #     demand by get_or_build_proctor_video() (ffmpeg concat, cached by
 #     segment count). See VIDEO_SEGMENT_INTERVAL_MS /
-#     MAX_VIDEO_SEGMENTS_PER_SESSION / VIDEO_MAX_DIMENSION_PX below.
+#     MAX_VIDEO_SEGMENTS_PER_SESSION / VIDEO_QUALITY_PRESETS below.
 #
 # Capture cadence is intentionally conservative to keep storage and bandwidth
 # bounded: one frame every CAPTURE_INTERVAL_MS (screen) /
@@ -220,9 +220,23 @@ MIN_SPEECH_DURATION_SEC = 0.3
 # get_or_build_proctor_video().
 VIDEO_SEGMENT_INTERVAL_MS      = 30_000  # length of each recorded segment
 MAX_VIDEO_SEGMENTS_PER_SESSION = 240     # hard cap (~2 hours at the interval above)
-VIDEO_MAX_DIMENSION_PX         = 480     # downscale so the long edge is at most this ("480p")
 VIDEO_CAPTURE_FPS              = 15      # frames/sec drawn onto the recording canvas
-VIDEO_BITS_PER_SECOND          = 400_000 # target bitrate, kept low given the 480p/15fps target
+
+# Resolution ("long edge" downscale target) + bitrate are admin-configurable
+# (Admin Panel -> Maintenance -> Video Recording Quality), stored in the
+# single-row proctor_settings table (see get_proctor_video_quality()/
+# set_proctor_video_quality() below) rather than fixed constants. The chosen
+# tier is looked up once per render_proctor_monitor() call and handed to the
+# _SCREEN_SHARE_JS/_WEBCAM_MONITOR_JS components via their `data` prop, so a
+# tier change takes effect for the next proctoring session that starts, not
+# retroactively for one already recording. "medium" reproduces the original
+# fixed values this used to be hardcoded to ("480p"/400kbps).
+VIDEO_QUALITY_PRESETS = {
+    "low":    {"max_dimension_px": 360, "bits_per_second": 250_000},
+    "medium": {"max_dimension_px": 480, "bits_per_second": 400_000},
+    "high":   {"max_dimension_px": 720, "bits_per_second": 800_000},
+}
+DEFAULT_VIDEO_QUALITY = "medium"
 
 # ---- Combined (screen + webcam-PiP + audio) review recording ----
 # get_or_build_combined_proctor_video() composites the already-stitched
@@ -360,18 +374,23 @@ export default function(component) {{
 
 _SCREEN_SHARE_JS = f"""
 export default function(component) {{
-    const {{ setTriggerValue, parentElement }} = component;
+    const {{ setTriggerValue, parentElement, data }} = component;
 
     const CAPTURE_INTERVAL_MS    = {CAPTURE_INTERVAL_MS};
     const MAX_FRAME_DIMENSION_PX = {MAX_FRAME_DIMENSION_PX};
     const JPEG_QUALITY            = {JPEG_QUALITY};
     const MAX_FRAMES              = {MAX_FRAMES_PER_SESSION};
 
+    // Resolution/bitrate come from the admin-configurable quality tier (see
+    // VIDEO_QUALITY_PRESETS in proctoring_feature.py), passed in via `data`
+    // on every render_proctor_monitor() call. The literal fallbacks below
+    // (the "medium" preset) only matter if this ever mounts before `data`
+    // is populated.
     const VIDEO_SEGMENT_INTERVAL_MS = {VIDEO_SEGMENT_INTERVAL_MS};
     const MAX_VIDEO_SEGMENTS        = {MAX_VIDEO_SEGMENTS_PER_SESSION};
-    const VIDEO_MAX_DIMENSION_PX    = {VIDEO_MAX_DIMENSION_PX};
+    const VIDEO_MAX_DIMENSION_PX    = (data && data.video_max_dimension_px) || {VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY]["max_dimension_px"]};
     const VIDEO_CAPTURE_FPS         = {VIDEO_CAPTURE_FPS};
-    const VIDEO_BITS_PER_SECOND     = {VIDEO_BITS_PER_SECOND};
+    const VIDEO_BITS_PER_SECOND     = (data && data.video_bits_per_second) || {VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY]["bits_per_second"]};
     const VIDEO_MIME_CANDIDATES     = ["video/webm;codecs=vp8", "video/webm;codecs=vp9", "video/webm"];
 
     const btn = document.createElement("button");
@@ -525,18 +544,20 @@ export default function(component) {{
 
 _WEBCAM_MONITOR_JS = f"""
 export default function(component) {{
-    const {{ setTriggerValue, parentElement }} = component;
+    const {{ setTriggerValue, parentElement, data }} = component;
 
     const CAPTURE_INTERVAL_MS    = {CAMERA_CAPTURE_INTERVAL_MS};
     const MAX_FRAME_DIMENSION_PX = {MAX_CAMERA_FRAME_DIMENSION_PX};
     const JPEG_QUALITY            = {CAMERA_JPEG_QUALITY};
     const MAX_FRAMES              = {MAX_CAMERA_FRAMES_PER_SESSION};
 
+    // See _SCREEN_SHARE_JS for why these come from `data` instead of being
+    // fixed constants.
     const VIDEO_SEGMENT_INTERVAL_MS = {VIDEO_SEGMENT_INTERVAL_MS};
     const MAX_VIDEO_SEGMENTS        = {MAX_VIDEO_SEGMENTS_PER_SESSION};
-    const VIDEO_MAX_DIMENSION_PX    = {VIDEO_MAX_DIMENSION_PX};
+    const VIDEO_MAX_DIMENSION_PX    = (data && data.video_max_dimension_px) || {VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY]["max_dimension_px"]};
     const VIDEO_CAPTURE_FPS         = {VIDEO_CAPTURE_FPS};
-    const VIDEO_BITS_PER_SECOND     = {VIDEO_BITS_PER_SECOND};
+    const VIDEO_BITS_PER_SECOND     = (data && data.video_bits_per_second) || {VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY]["bits_per_second"]};
 
     const btn = document.createElement("button");
     btn.textContent = "Enable Camera Monitoring";
@@ -796,6 +817,54 @@ _mouse_monitor        = st.components.v2.component("quiz_mouse_monitor", js=_MOU
 _screen_share_button  = st.components.v2.component("quiz_screen_share_button", js=_SCREEN_SHARE_JS)
 _webcam_monitor_button = st.components.v2.component("quiz_webcam_monitor_button", js=_WEBCAM_MONITOR_JS)
 _audio_monitor_button  = st.components.v2.component("quiz_audio_monitor_button", js=_AUDIO_MONITOR_JS)
+
+
+def get_proctor_video_quality() -> str:
+    """
+    Return the currently configured proctoring video-recording quality tier
+    ("low" | "medium" | "high") from the single row in proctor_settings.
+
+    Falls back to DEFAULT_VIDEO_QUALITY if the row is missing (e.g. the
+    migration/schema hasn't been applied yet) rather than raising, since a
+    missing setting should degrade to the original fixed behavior, not break
+    proctoring.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT video_quality FROM proctor_settings WHERE id = 1")
+        row = cursor.fetchone()
+        return row[0] if row else DEFAULT_VIDEO_QUALITY
+    except Exception:
+        return DEFAULT_VIDEO_QUALITY
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def set_proctor_video_quality(quality: str) -> None:
+    """
+    Persist the admin-selected proctoring video-recording quality tier.
+
+    Only affects proctoring sessions whose screen/webcam recording starts
+    after this call — see VIDEO_QUALITY_PRESETS above.
+    """
+    if quality not in VIDEO_QUALITY_PRESETS:
+        raise ValueError(f"Unknown video quality tier: {quality!r}")
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO proctor_settings (id, video_quality) VALUES (1, %s)
+            ON DUPLICATE KEY UPDATE video_quality = VALUES(video_quality)
+            """,
+            (quality,),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def save_proctor_event(
@@ -3105,6 +3174,21 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
     webcam_key = f"proctor_webcam_status_{gate_key}"
     audio_key = f"proctor_audio_status_{gate_key}"
 
+    # Fetched once per session rather than on every rerun (this function is
+    # called on every rerun for as long as the quiz is open) — the admin's
+    # quality tier only ever needs to apply from the moment recording starts,
+    # so there's no benefit to re-reading it mid-session, only extra DB load.
+    quality_key = f"proctor_video_quality_{gate_key}"
+    if quality_key not in st.session_state:
+        st.session_state[quality_key] = get_proctor_video_quality()
+    video_quality_preset = VIDEO_QUALITY_PRESETS.get(
+        st.session_state[quality_key], VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY]
+    )
+    video_quality_data = {
+        "video_max_dimension_px": video_quality_preset["max_dimension_px"],
+        "video_bits_per_second": video_quality_preset["bits_per_second"],
+    }
+
     if share_key not in st.session_state:
         st.info(
             "This quiz is monitored for academic integrity. Tab switches, "
@@ -3127,6 +3211,7 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
     # initial granted/denied outcome was already recorded below.
     share_result = _screen_share_button(
         key=f"proctor_share_{session_id}",
+        data=video_quality_data,
         on_screen_share_change=lambda: None,
         on_frame_change=lambda: None,
         on_video_chunk_change=lambda: None,
@@ -3155,6 +3240,7 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
     # webcam permission prompt and its periodic frame captures.
     webcam_result = _webcam_monitor_button(
         key=f"proctor_webcam_{session_id}",
+        data=video_quality_data,
         on_webcam_change=lambda: None,
         on_frame_change=lambda: None,
         on_video_chunk_change=lambda: None,

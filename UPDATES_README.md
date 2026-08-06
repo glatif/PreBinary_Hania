@@ -14,7 +14,7 @@
 
 **5. Proctoring — Keystroke Tracking** — Logs keystrokes (sent every ~15s, not per keypress) alongside existing tab-switch and screen-share monitoring. Teachers/admins can now delete a student's monitoring data per attempt/assessment, in addition to the existing bulk age-based cleanup.
 
-**6. Proctoring — Audio/Video Recording** — Records actual mic audio (10s clips, kept only if speech detected) and screen+webcam video (30s segments, 480p, ~2hr cap). Instructors can stitch segments into full recordings (screen, webcam+audio, or combined picture-in-picture) via a button. Heavy analysis now runs in the background (every 15 min) or on-demand via Admin Panel → Maintenance → "Run Proctoring Analysis Now," instead of slowing down live monitoring.
+**6. Proctoring — Audio/Video Recording** — Records actual mic audio (10s clips, kept only if speech detected) and screen+webcam video (30s segments, admin-configurable quality — see #12 — ~2hr cap). Instructors can stitch segments into full recordings (screen, webcam+audio, or combined picture-in-picture) via a button. Heavy analysis now runs in the background (every 15 min) or on-demand via Admin Panel → Maintenance → "Run Proctoring Analysis Now," instead of slowing down live monitoring.
 
 **7. Oral Examination (new feature/tab)** — AI generates questions from teacher material; students answer by speaking; AI grades transcripts.
 - Questions are read aloud (TTS), mic stays on the whole time, recording starts automatically per question.
@@ -32,10 +32,12 @@
 
 **11. Database Schema** — `schema_clean.sql` and `schema_demo.sql` now create every table this update needs (oral exam, attempt log, verification photos, audio/video proctoring) directly, so a fresh database no longer requires running any `migration_add_*.sql` files by hand. `schema_demo.sql` was also brought up to date with older proctoring tables it had been missing.
 
+**12. Proctoring — Configurable Video Quality** — Admins can now pick a Low (360p)/Medium (480p, previous default)/High (720p) recording quality for proctoring screen+webcam video, from Admin Panel → Maintenance → "Video Recording Quality." Only applies to sessions that start recording after the change — a session already recording keeps using whatever tier was active when it started.
+
 ## Setup needed before using
 
 - **Fresh server / new database:** just run `schema_clean.sql` (or `schema_demo.sql` for seeded demo accounts) as usual — everything is already included.
-- **Existing database you want to keep data in:** run the new `migration_add_*.sql` files instead of recreating the schema (`migration_add_proctor_analysis_status.sql` must run after `migration_add_audio_proctoring.sql`/`migration_add_video_proctoring.sql`, since it alters their tables).
+- **Existing database you want to keep data in:** run the new `migration_add_*.sql` files instead of recreating the schema (`migration_add_proctor_analysis_status.sql` must run after `migration_add_audio_proctoring.sql`/`migration_add_video_proctoring.sql`, since it alters their tables; `migration_add_proctor_video_quality_setting.sql` can run any time).
 - Add a Groq or OpenAI key under **Profile → AI API Keys** for any account taking an oral exam.
 - If using the local model for oral exam questions, make sure Ollama is running with `deepseek-r1:1.5b` pulled.
 - `pip install -r requirements.txt` picks up new packages automatically (no manual downloads needed).

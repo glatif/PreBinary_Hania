@@ -936,6 +936,25 @@ CREATE TABLE quiz_proctor_video_segments (
 
 
 -- =============================================================================
+-- 24C. PROCTOR SETTINGS (video-recording quality)
+-- =============================================================================
+-- Single-row table (id is always 1) holding the admin-configurable
+-- video-recording quality tier applied to new proctoring screen/webcam
+-- recordings — see VIDEO_QUALITY_PRESETS and get_proctor_video_quality()/
+-- set_proctor_video_quality() in proctoring_feature.py. Set from the Admin
+-- Panel's Maintenance tab (app.py). A tier change only affects sessions
+-- whose screen/webcam recording starts after the change.
+
+CREATE TABLE proctor_settings (
+    id            INT PRIMARY KEY DEFAULT 1,
+    video_quality ENUM('low', 'medium', 'high') NOT NULL DEFAULT 'medium',
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO proctor_settings (id, video_quality) VALUES (1, 'medium');
+
+
+-- =============================================================================
 -- 25. VERIFICATION ATTEMPTS
 -- =============================================================================
 -- Audit log of every identity-verification attempt made through the

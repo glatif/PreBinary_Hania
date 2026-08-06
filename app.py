@@ -117,6 +117,9 @@ from src.features.proctoring.proctoring_feature import (
     cleanup_old_proctor_data,
     process_pending_proctor_analysis,
     start_proctor_analysis_scheduler,
+    get_proctor_video_quality,
+    set_proctor_video_quality,
+    VIDEO_QUALITY_PRESETS,
 )
 
 # llm_utils.MODELS is referenced by the profile page to build per-feature model
@@ -2199,9 +2202,16 @@ def _admin_maintenance_tab():
     """
     Admin Panel → Maintenance tab.
 
-    Holds two actions:
+    Holds three sections:
 
-      1. Run Proctoring Analysis: process_pending_proctor_analysis() in
+      1. Video Recording Quality: lets an admin pick the resolution/bitrate
+         tier (VIDEO_QUALITY_PRESETS in proctoring_feature.py) applied to new
+         proctoring screen/webcam recordings, persisted in the single-row
+         proctor_settings table via get_proctor_video_quality()/
+         set_proctor_video_quality(). Only affects sessions whose recording
+         starts after the change — a session already recording keeps using
+         whatever tier was current when it started.
+      2. Run Proctoring Analysis: process_pending_proctor_analysis() in
          proctoring_feature.py — runs the CPU-heavy face/gaze (mediapipe)
          and speech-detection (Silero VAD) analysis that capture time
          deliberately skips, over every webcam frame/audio clip still
@@ -2211,7 +2221,7 @@ def _admin_maintenance_tab():
          startup) — results are typically already waiting by the time an
          admin opens a review page. The button here is for an immediate,
          on-demand run instead of waiting for the next automatic sweep.
-      2. Run Proctoring Data Cleanup: purge proctoring data (tab-switch/
+      3. Run Proctoring Data Cleanup: purge proctoring data (tab-switch/
          focus-loss events, screen-capture frame files, webcam frame files,
          keystroke logs, mouse activity logs, speech-positive audio clips,
          and full-session screen/webcam video segments) older than a chosen
@@ -2222,6 +2232,33 @@ def _admin_maintenance_tab():
          nothing purges data unless an admin clicks the button (or an
          external scheduler calls the same function directly).
     """
+    st.subheader("Video Recording Quality")
+    st.write(
+        "Resolution and bitrate used for the continuous screen and webcam "
+        "recordings captured during a proctored session. Higher quality "
+        "means larger files and more storage/bandwidth use. Changing this "
+        "only affects sessions that start recording after you save it — "
+        "it won't change a recording already in progress."
+    )
+    quality_labels = {
+        "low": "Low (360p, smaller files)",
+        "medium": "Medium (480p, default)",
+        "high": "High (720p, larger files)",
+    }
+    quality_options = list(VIDEO_QUALITY_PRESETS.keys())
+    current_quality = get_proctor_video_quality()
+    selected_quality = st.selectbox(
+        "Quality tier",
+        options=quality_options,
+        index=quality_options.index(current_quality) if current_quality in quality_options else quality_options.index("medium"),
+        format_func=lambda q: quality_labels.get(q, q),
+    )
+    if st.button("Save Video Recording Quality", type="primary"):
+        set_proctor_video_quality(selected_quality)
+        st.success(f"Video recording quality set to {quality_labels.get(selected_quality, selected_quality)}.")
+
+    st.divider()
+
     st.subheader("Proctoring Analysis")
     st.write(
         "Webcam frames and microphone segments are captured live during a "
