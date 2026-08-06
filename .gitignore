@@ -56,10 +56,8 @@ data/oral_examination/
 data/verification_photos/
 
 # Data files (uncomment if you don't want to include data files in your repository)
-# data/
-# *.npy
-# *.index
-# *.json
+data/
+
 
 # MacOS
 .DS_Store
