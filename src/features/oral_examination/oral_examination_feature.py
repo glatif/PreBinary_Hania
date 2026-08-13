@@ -52,6 +52,7 @@ from auth import save_uploaded_file
 
 from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, generate_llm_response, strip_llm_json, transcribe_audio
 from src.features.exam_verification.exam_verification_feature import verify_student_identity
+from src.utils.access_gate import verify_access_code
 from src.features.exam_grading.exam_grading_feature import create_grading_prompt
 from src.features.quiz_generator.document_processor import (
     process_uploaded_files,
@@ -156,26 +157,31 @@ def save_oral_exam_setup(
     rubric: str,
     max_points_per_question: int,
     set_by: int,
+    access_code: str = None,
 ) -> None:
     """
     Persist the canonical oral exam setup for an assessment. One row per
     assessment — upserted on every save, since a teacher revising the exam
     should replace the prior version rather than accumulate duplicates.
+
+    access_code is optional — None/blank means students need no code to
+    start, matching the previous (pre-access-code) behavior.
     """
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             """
-            INSERT INTO oral_exam_setups (assessment_id, questions, rubric, max_points_per_question, set_by)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO oral_exam_setups (assessment_id, questions, rubric, max_points_per_question, access_code, set_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 questions = VALUES(questions),
                 rubric = VALUES(rubric),
                 max_points_per_question = VALUES(max_points_per_question),
+                access_code = VALUES(access_code),
                 set_by = VALUES(set_by)
             """,
-            (assessment_id, questions, rubric, max_points_per_question, set_by),
+            (assessment_id, questions, rubric, max_points_per_question, access_code or None, set_by),
         )
         conn.commit()
     finally:
@@ -189,7 +195,7 @@ def get_oral_exam_setup(assessment_id: int) -> Dict:
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(
-            "SELECT questions, rubric, max_points_per_question, updated_at "
+            "SELECT questions, rubric, max_points_per_question, access_code, updated_at "
             "FROM oral_exam_setups WHERE assessment_id = %s",
             (assessment_id,),
         )
@@ -850,7 +856,11 @@ def _render_student_oral_exam(
         )
         return
 
-    if not verify_student_identity(user, gate_key=f"oral_exam_{assessment_id}"):
+    oral_gate_key = f"oral_exam_{assessment_id}"
+    if not verify_access_code(setup.get("access_code"), gate_key=oral_gate_key):
+        return
+
+    if not verify_student_identity(user, gate_key=oral_gate_key):
         return
 
     session_key = f"oral_exam_session_id_{assessment_id}"
@@ -1122,6 +1132,7 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
     content_key = f"oral_setup_content_{assessment_id}"
     rubric_key = f"oral_setup_rubric_{assessment_id}"
     points_key = f"oral_setup_points_{assessment_id}"
+    access_code_key = f"oral_setup_access_code_{assessment_id}"
 
     if questions_key not in st.session_state:
         existing_setup = get_oral_exam_setup(assessment_id)
@@ -1132,11 +1143,14 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
                 st.session_state[questions_key] = []
             st.session_state[rubric_key] = existing_setup.get("rubric") or ""
             st.session_state[points_key] = existing_setup.get("max_points_per_question") or 10
+            st.session_state[access_code_key] = existing_setup.get("access_code") or ""
         else:
             st.session_state[questions_key] = []
             st.session_state[rubric_key] = ""
             st.session_state[points_key] = 10
+            st.session_state[access_code_key] = ""
     st.session_state.setdefault(content_key, "")
+    st.session_state.setdefault(access_code_key, "")
 
     source_mode = st.radio(
         "Source material for question generation",
@@ -1303,6 +1317,12 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
         value=int(st.session_state[points_key]),
         key=f"{points_key}_widget",
     )
+    st.session_state[access_code_key] = st.text_input(
+        "Access code (optional)",
+        value=st.session_state[access_code_key],
+        key=f"{access_code_key}_widget",
+        help="If set, students must enter this code before they can start. Leave blank to require no code.",
+    )
 
     # Students identify "their next question" by matching question_number
     # against the live setup (see _render_student_oral_exam), so editing and
@@ -1334,6 +1354,7 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
             questions=json.dumps(st.session_state[questions_key]),
             rubric=st.session_state[rubric_key],
             max_points_per_question=int(st.session_state[points_key]),
+            access_code=st.session_state[access_code_key].strip() or None,
             set_by=set_by,
         )
         total_possible = len(st.session_state[questions_key]) * int(st.session_state[points_key])

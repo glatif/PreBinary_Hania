@@ -28,6 +28,7 @@
 
 import os
 import json
+import re
 import uuid
 import streamlit as st
 import pandas as pd
@@ -40,6 +41,7 @@ from auth import save_uploaded_file, delete_physical_file
 from src.utils.llm_utils import MODELS, generate_llm_response, MODEL_PROVIDERS, strip_llm_json
 from src.utils.pdf_utils import extract_text_from_pdf, save_uploaded_pdf
 from src.features.exam_verification.exam_verification_feature import verify_student_identity
+from src.utils.access_gate import verify_access_code
 from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
     get_proctor_summary_by_user_assessment,
@@ -151,6 +153,88 @@ def save_exam_grading_result(
         conn.close()
 
 
+def save_exam_grading_question_results(
+    grading_session_id: str,
+    graded_by: int,
+    assessment_id: int,
+    student_name: str,
+    student_id_parsed: str,
+    model_name: str,
+    breakdown: List[Dict],
+) -> None:
+    """
+    Persist a per-question breakdown for one student's graded submission,
+    one row per entry in `breakdown` (as parsed from the "question_breakdown"
+    array requested by create_grading_prompt() when num_questions > 1).
+
+    Each entry is expected to have question_number, score, max_points, and
+    optionally feedback — question_text/student_answer are not split out
+    from the original blob upload, so they're left blank; the aggregate
+    exam_grading_results row still carries the full text for reference.
+    Called only when a valid breakdown was parsed — callers should skip this
+    entirely (not call it with an empty list) when the LLM omitted or
+    malformed the array, since the aggregate score alone is still valid.
+    """
+    if not breakdown:
+        return
+    model_provider = MODEL_PROVIDERS.get(model_name)
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.executemany(
+            """
+            INSERT INTO exam_grading_question_results (
+                grading_session_id, graded_by, assessment_id,
+                student_name, student_id_parsed,
+                question_number, question_text, score, max_points, feedback,
+                model_provider, model_name
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    grading_session_id, graded_by, assessment_id,
+                    student_name, student_id_parsed,
+                    int(entry["question_number"]), entry.get("question_text", ""),
+                    entry["score"], entry["max_points"], entry.get("feedback", ""),
+                    model_provider, model_name,
+                )
+                for entry in breakdown
+            ],
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_exam_grading_question_results(grading_session_id: str, student_name: str = None) -> List[Dict]:
+    """
+    Return per-question breakdown rows for a grading session, ordered by
+    student then question number. Filtered to one student when given (used
+    by the per-student review expander); returns all students' rows otherwise.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        query = """
+            SELECT student_name, student_id_parsed, question_number, question_text,
+                   score, max_points, feedback
+            FROM exam_grading_question_results
+            WHERE grading_session_id = %s
+        """
+        params = [grading_session_id]
+        if student_name is not None:
+            query += " AND student_name = %s"
+            params.append(student_name)
+        query += " ORDER BY student_name, question_number"
+        cursor.execute(query, tuple(params))
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+
 # =============================================================================
 # STUDENT SUBMISSION — "Submit My Exam"
 # =============================================================================
@@ -233,6 +317,7 @@ def save_exam_setup(
     sub_rubric: str,
     max_points: int,
     set_by: int,
+    access_code: str = None,
 ) -> None:
     """
     Persist the canonical exam setup for an assessment so students can read
@@ -240,22 +325,26 @@ def save_exam_setup(
     are never shown to students). One row per assessment — upserted on every
     save, since a teacher revising the exam should replace the prior version
     rather than accumulate duplicates.
+
+    access_code is optional — None/blank means students need no code to
+    submit, matching the previous (pre-access-code) behavior.
     """
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             """
-            INSERT INTO exam_setups (assessment_id, questions, rubric, sub_rubric, max_points, set_by)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO exam_setups (assessment_id, questions, rubric, sub_rubric, max_points, access_code, set_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
-                questions  = VALUES(questions),
-                rubric     = VALUES(rubric),
-                sub_rubric = VALUES(sub_rubric),
-                max_points = VALUES(max_points),
-                set_by     = VALUES(set_by)
+                questions   = VALUES(questions),
+                rubric      = VALUES(rubric),
+                sub_rubric  = VALUES(sub_rubric),
+                max_points  = VALUES(max_points),
+                access_code = VALUES(access_code),
+                set_by      = VALUES(set_by)
             """,
-            (assessment_id, questions, rubric, sub_rubric, max_points, set_by),
+            (assessment_id, questions, rubric, sub_rubric, max_points, access_code or None, set_by),
         )
         conn.commit()
     finally:
@@ -269,7 +358,7 @@ def get_exam_setup(assessment_id: int) -> Dict:
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(
-            "SELECT questions, rubric, sub_rubric, max_points, updated_at "
+            "SELECT questions, rubric, sub_rubric, max_points, access_code, updated_at "
             "FROM exam_setups WHERE assessment_id = %s",
             (assessment_id,),
         )
@@ -324,7 +413,11 @@ def _render_student_exam_submission(
 
     st.divider()
 
-    if not verify_student_identity(user, gate_key=f"exam_grading_{assessment_id}"):
+    gate_key = f"exam_grading_{assessment_id}"
+    if not verify_access_code(setup.get("access_code"), gate_key=gate_key):
+        return
+
+    if not verify_student_identity(user, gate_key=gate_key):
         return
 
     render_proctor_monitor(
@@ -518,12 +611,67 @@ def update_exam_grading_feedback(
 # LLM PROMPT BUILDER
 # =============================================================================
 
+_NUMBERED_QUESTION_RE = re.compile(r"^\s*(\d+)[.)]\s+", re.MULTILINE)
+
+
+def split_numbered_questions(questions_text: str) -> List[str]:
+    """
+    Split a numbered questions block (as produced by format_questions_with_llm(),
+    e.g. "1. What is...\n2. Explain...") into a list of individual question
+    strings, one per detected number. Returns an empty list if no numbered
+    questions are detected (e.g. free-form text with no "1." markers) —
+    callers should treat that as "can't determine per-question breakdown"
+    and fall back to aggregate-only grading rather than guessing.
+    """
+    if not questions_text:
+        return []
+    matches = list(_NUMBERED_QUESTION_RE.finditer(questions_text))
+    if len(matches) < 2:
+        return []
+    questions = []
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(questions_text)
+        questions.append(questions_text[start:end].strip())
+    return questions
+
+
+def extract_valid_question_breakdown(result_json: dict, num_questions: int) -> List[Dict]:
+    """
+    Validate and coerce the "question_breakdown" array the LLM may have
+    included in its grading response (see create_grading_prompt()).
+
+    Returns a cleaned list of {question_number, score, max_points, feedback}
+    dicts (score/max_points coerced to int) only if the array is present,
+    is a list of exactly num_questions entries, and every entry's
+    question_number/score/max_points can be coerced to a number. Returns an
+    empty list otherwise — callers should skip per-question storage entirely
+    in that case rather than save partial/malformed data.
+    """
+    breakdown = result_json.get("question_breakdown")
+    if num_questions <= 1 or not isinstance(breakdown, list) or len(breakdown) != num_questions:
+        return []
+    cleaned = []
+    try:
+        for entry in breakdown:
+            cleaned.append({
+                "question_number": int(entry["question_number"]),
+                "score": max(0, int(float(entry["score"]))),
+                "max_points": max(1, int(float(entry["max_points"]))),
+                "feedback": str(entry.get("feedback", "")).strip(),
+            })
+    except (KeyError, TypeError, ValueError):
+        return []
+    return cleaned
+
+
 def create_grading_prompt(
     question: str,
     rubric: str,
     sub_rubric: str,
     student_answer: str,
     max_points: int,
+    num_questions: int = 1,
 ) -> str:
     """
     Build the LLM prompt used to grade a single student's submission.
@@ -533,17 +681,46 @@ def create_grading_prompt(
     and a numerical score. The JSON template is embedded verbatim so the model
     has an unambiguous format to follow.
 
+    When num_questions > 1 (the exam's questions block was successfully split
+    into individually numbered questions via split_numbered_questions()), the
+    prompt additionally asks for a "question_breakdown" array — one entry per
+    question, each with its own score — so a per-question breakdown can be
+    stored alongside the aggregate score without a second LLM call. Callers
+    must treat this array as optional: older/smaller models may omit it or
+    return it malformed, in which case the aggregate score is still valid
+    and per-question storage is simply skipped.
+
     The response is parsed in exam_grading_ui(). If the top-level parse fails,
     a fallback extraction attempts to locate the JSON object within any
     surrounding text the model may have added.
     """
-    json_template = """{
+    breakdown_field = ""
+    breakdown_instructions = ""
+    if num_questions > 1:
+        breakdown_field = """,
+  "question_breakdown": [
+    {"question_number": 1, "score": REPLACE_WITH_INTEGER, "max_points": REPLACE_WITH_INTEGER, "feedback": "one sentence"},
+    {"question_number": 2, "score": REPLACE_WITH_INTEGER, "max_points": REPLACE_WITH_INTEGER, "feedback": "one sentence"}
+  ]"""
+        breakdown_instructions = f"""
+- The question text above contains {num_questions} separate numbered questions.
+  Grade each one individually and include a "question_breakdown" array with
+  exactly {num_questions} entries, one per question number, in order.
+- Divide MAXIMUM POINTS ({max_points}) across the {num_questions} questions
+  (as evenly as reasonable, matching how the rubric weights them) and use
+  those per-question max_points consistently between "max_points" in each
+  breakdown entry and the score you award there.
+- The top-level "score" MUST equal the sum of all question_breakdown scores,
+  and the top-level max_points in this response's JSON MUST equal the sum of
+  all question_breakdown max_points."""
+
+    json_template = f"""{{
   "student_name": "STUDENT_NAME",
   "student_id": "STUDENT_ID",
   "detailed_explanation": "thorough feedback referencing each rubric criterion and explaining what the student did well and what was missing",
   "feedback": "one concise sentence of constructive feedback for the student",
-  "score": REPLACE_WITH_INTEGER
-}"""
+  "score": REPLACE_WITH_INTEGER{breakdown_field}
+}}"""
     return f"""You are an expert teacher grading an exam response.
 Evaluate the student's answer strictly against the rubric and criteria below.
 
@@ -552,7 +729,7 @@ SCORING RULES:
 - Award {max_points} (full marks) if the answer fully satisfies every criterion.
 - Deduct marks only for specific missing or incorrect content, not for writing style.
 - Do NOT apply a penalty if a criterion is not mentioned but is also not wrong.
-- Every point deducted must be explained in detailed_explanation.
+- Every point deducted must be explained in detailed_explanation.{breakdown_instructions}
 
 ---
 QUESTION:
@@ -983,6 +1160,9 @@ def exam_grading_ui() -> None:
         st.session_state.sub_rubric = ""
     if "max_points" not in st.session_state:
         st.session_state.max_points = 100
+    if "eg_access_code" not in st.session_state:
+        existing_setup = get_exam_setup(assessment_id) or {}
+        st.session_state.eg_access_code = existing_setup.get("access_code") or ""
     # Tracks which input method is selected in the Setup Exam tab. Set to
     # "Enter questions manually" when setup is loaded from history so that
     # the loaded questions text is immediately visible in the text area.
@@ -1234,6 +1414,12 @@ def exam_grading_ui() -> None:
             value=st.session_state.max_points,
         )
 
+        st.session_state.eg_access_code = st.text_input(
+            "Access code (optional):",
+            value=st.session_state.eg_access_code,
+            help="If set, students must enter this code before they can submit. Leave blank to require no code.",
+        )
+
         setup_col1, setup_col2 = st.columns(2)
         with setup_col1:
             if st.session_state.questions and st.button(
@@ -1245,6 +1431,7 @@ def exam_grading_ui() -> None:
                     rubric=st.session_state.rubric,
                     sub_rubric=st.session_state.sub_rubric,
                     max_points=int(st.session_state.max_points),
+                    access_code=st.session_state.eg_access_code.strip() or None,
                     set_by=int(st.session_state["user"]["id"]),
                 )
                 st.success(
@@ -1637,6 +1824,14 @@ def exam_grading_ui() -> None:
                 total_steps     = len(st.session_state.submissions)
                 completed_steps = 0
 
+                # Split once per grading run, not per student — the questions
+                # block is the same for every submission. num_questions > 1
+                # tells create_grading_prompt() to also request a per-question
+                # breakdown; a single detected "question" (or none) falls back
+                # to aggregate-only grading exactly as before this feature was added.
+                detected_questions = split_numbered_questions(st.session_state.questions)
+                num_questions = len(detected_questions)
+
                 for submission in st.session_state.submissions:
                     student_name = submission["student_name"]
                     student_id   = submission.get("student_id", "")
@@ -1650,6 +1845,7 @@ def exam_grading_ui() -> None:
                         sub_rubric=st.session_state.sub_rubric,
                         max_points=st.session_state.max_points,
                         student_answer=content,
+                        num_questions=num_questions,
                     )
 
                     # Computing the grade (LLM call + JSON parsing) and persisting
@@ -1716,6 +1912,13 @@ def exam_grading_ui() -> None:
                         result_json["student_id"]         = student_id
                         result_json["grading_session_id"] = grading_session_id
 
+                        # Optional per-question breakdown — see
+                        # extract_valid_question_breakdown()'s docstring for
+                        # why a malformed/missing array is silently dropped
+                        # rather than treated as a grading failure: the
+                        # aggregate score above is independently valid.
+                        question_breakdown = extract_valid_question_breakdown(result_json, num_questions)
+
                     except Exception as e:
                         st.error(f"Error grading {student_name}'s submission: {str(e)}")
                         result_json = {
@@ -1727,6 +1930,7 @@ def exam_grading_ui() -> None:
                             "detailed_explanation": f"Failed to process submission: {str(e)}",
                             "grading_session_id":   grading_session_id,
                         }
+                        question_breakdown = []
 
                     # Always attempt to persist, even the fallback/error result
                     # above — a student who was actually graded (or who at
@@ -1757,6 +1961,23 @@ def exam_grading_ui() -> None:
                             f"Graded {student_name}'s submission, but failed to save it to "
                             f"the database — it will NOT appear in History. Details: {str(e)}"
                         )
+
+                    if question_breakdown:
+                        try:
+                            save_exam_grading_question_results(
+                                grading_session_id=grading_session_id,
+                                graded_by=graded_by,
+                                assessment_id=assessment_id,
+                                student_name=student_name,
+                                student_id_parsed=student_id,
+                                model_name=selected_model,
+                                breakdown=question_breakdown,
+                            )
+                        except Exception as e:
+                            st.warning(
+                                f"Saved {student_name}'s overall score, but the per-question "
+                                f"breakdown failed to save: {str(e)}"
+                            )
 
                     graded_results.append(result_json)
 
@@ -1826,6 +2047,21 @@ def exam_grading_ui() -> None:
                             height=180,
                             key=f"eg_edit_explanation_{i}",
                         )
+
+                        question_rows = get_exam_grading_question_results(
+                            result.get("grading_session_id", ""), result["student_name"]
+                        )
+                        if question_rows:
+                            st.markdown("**Per-Question Breakdown**")
+                            st.table(pd.DataFrame([
+                                {
+                                    "Q#": r["question_number"],
+                                    "Score": f"{r['score']}/{r['max_points']}",
+                                    "Feedback": r.get("feedback", ""),
+                                }
+                                for r in question_rows
+                            ]))
+
                         if st.button("💾 Save Changes", key=f"eg_save_feedback_{i}"):
                             st.session_state.graded_results[i]["feedback"]            = edited_feedback
                             st.session_state.graded_results[i]["detailed_explanation"] = edited_explanation
@@ -1910,6 +2146,20 @@ def exam_grading_ui() -> None:
                                 st.write(f"**Provider:** {result.get('model_provider', '')}")
                                 st.markdown("**Detailed Explanation:**")
                                 st.write(result.get("detailed_explanation", ""))
+
+                                question_rows = get_exam_grading_question_results(
+                                    session_id, result.get("student_name", "")
+                                )
+                                if question_rows:
+                                    st.markdown("**Per-Question Breakdown:**")
+                                    st.table(pd.DataFrame([
+                                        {
+                                            "Q#": r["question_number"],
+                                            "Score": f"{r['score']}/{r['max_points']}",
+                                            "Feedback": r.get("feedback", ""),
+                                        }
+                                        for r in question_rows
+                                    ]))
 
                     st.markdown("---")
 

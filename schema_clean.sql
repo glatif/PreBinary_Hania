@@ -122,6 +122,12 @@ CREATE TABLE users (
     status     ENUM('active', 'inactive')                   DEFAULT 'inactive',
     created_at TIMESTAMP                                     DEFAULT CURRENT_TIMESTAMP,
 
+    -- Forces the mandatory change-password screen on next login. Set to 1
+    -- whenever a temp password is generated for the user (roster import,
+    -- admin-triggered email reset, forgot-password self-service) and cleared
+    -- back to 0 the moment the user successfully sets their own password.
+    must_change_password TINYINT(1) NOT NULL DEFAULT 0,
+
     INDEX idx_username (username),
     INDEX idx_email    (email)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -294,6 +300,9 @@ CREATE TABLE IF NOT EXISTS quizzes (
     published      TINYINT(1)   NOT NULL DEFAULT 0,
     grades_visible TINYINT(1)   NOT NULL DEFAULT 0,
     grading_mode   ENUM('auto', 'manual', 'ai') NOT NULL DEFAULT 'auto',
+    -- Optional code a student must enter before starting this quiz. NULL/blank
+    -- means no code is required (fully backward compatible with existing quizzes).
+    access_code    VARCHAR(50)  NULL,
     created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE
@@ -515,11 +524,54 @@ CREATE TABLE exam_setups (
     rubric        TEXT,
     sub_rubric    TEXT,
     max_points    INT  DEFAULT 100,
+    -- Optional code a student must enter before submitting this exam. NULL/blank
+    -- means no code is required (fully backward compatible with existing setups).
+    access_code   VARCHAR(50) NULL,
     set_by        INT  NOT NULL,
     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
     FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
     FOREIGN KEY (set_by)        REFERENCES users(id)       ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 15C. EXAM GRADING QUESTION RESULTS
+-- =============================================================================
+-- One row per student per question per grading run, modeled directly on
+-- oral_exam_grading_results below. exam_grading_results (15) stays as the
+-- aggregate/session-level row per student — its score/max_points are the
+-- SUM of this table's rows for the same grading_session_id + student, so
+-- the History tab and existing CSV export keep working unchanged. Lets
+-- instructors review a per-question breakdown for free-text exam grading,
+-- matching what Quizzes and Oral Exams already provide.
+--
+-- student_name/student_id_parsed are free text, not a FK to users(id) —
+-- exam_grading_results (15) uses the same pattern, since submissions can be
+-- graded from a bulk ZIP of files parsed by name/ID text rather than tied
+-- to a logged-in account.
+
+CREATE TABLE exam_grading_question_results (
+    id                    INT AUTO_INCREMENT PRIMARY KEY,
+    grading_session_id    VARCHAR(36)  NOT NULL,
+    graded_by             INT          NOT NULL,
+    assessment_id         INT          NOT NULL,
+    student_name          VARCHAR(255),
+    student_id_parsed     VARCHAR(100),
+    question_number       INT          NOT NULL,
+    question_text         TEXT         NOT NULL,
+    student_answer        MEDIUMTEXT,
+    score                 FLOAT        NOT NULL,
+    max_points            INT          NOT NULL,
+    feedback              TEXT,
+    detailed_explanation  MEDIUMTEXT,
+    model_provider        VARCHAR(50),
+    model_name            VARCHAR(100),
+    graded_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (graded_by)     REFERENCES users(id)       ON DELETE CASCADE,
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+    INDEX idx_exam_grading_question_session (grading_session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
@@ -963,6 +1015,27 @@ INSERT INTO proctor_settings (id, video_quality) VALUES (1, 'medium');
 
 
 -- =============================================================================
+-- 24D. APP SETTINGS (SMTP email credentials)
+-- =============================================================================
+-- Single-row table (id is always 1) holding the admin-configurable Gmail
+-- SMTP sender credentials used to email temp passwords and forgot-password
+-- resets to students — see get_smtp_config()/set_smtp_config() in auth.py.
+-- Set from the Admin Panel's Settings tab (app.py). Left blank so the app
+-- loads safely with no credentials configured; senders fall back to the
+-- SMTP_SENDER_EMAIL/SMTP_APP_PASSWORD environment variables if this row is
+-- also blank, and raise a clear "not configured" error if neither is set.
+
+CREATE TABLE app_settings (
+    id                INT PRIMARY KEY DEFAULT 1,
+    smtp_sender_email VARCHAR(255) NULL,
+    smtp_app_password VARCHAR(255) NULL,
+    updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO app_settings (id) VALUES (1);
+
+
+-- =============================================================================
 -- 25. VERIFICATION ATTEMPTS
 -- =============================================================================
 -- Audit log of every identity-verification attempt made through the
@@ -1033,6 +1106,9 @@ CREATE TABLE oral_exam_setups (
     questions               TEXT NOT NULL,
     rubric                  TEXT,
     max_points_per_question INT NOT NULL DEFAULT 10,
+    -- Optional code a student must enter before starting this oral exam.
+    -- NULL/blank means no code is required (backward compatible).
+    access_code             VARCHAR(50) NULL,
     set_by                  INT NOT NULL,
     updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
@@ -1127,4 +1203,34 @@ CREATE TABLE assessment_attempt_log (
     FOREIGN KEY (user_id)       REFERENCES users(id)       ON DELETE CASCADE,
     FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
     INDEX idx_attempt_log_lookup (assessment_id, feature_name, user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 30. PLAGIARISM RESULTS
+-- =============================================================================
+-- Pairwise similarity results between two students' submissions on the same
+-- assessment, computed on-demand (Admin Panel -> Maintenance -> "Run
+-- Plagiarism Scan") by src/utils/plagiarism.py using the app's existing
+-- local sentence-embedding model (src/utils/embedding_wrapper.py — no paid
+-- API key required). llm_explanation is only populated for pairs whose
+-- similarity_score crosses the flagging threshold, via one LLM call per
+-- flagged pair. student_a_id is always the smaller of the two user IDs so a
+-- re-run upserts the same row instead of duplicating the pair.
+
+CREATE TABLE plagiarism_results (
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    assessment_id    INT          NOT NULL,
+    feature_name     VARCHAR(50)  NOT NULL,
+    student_a_id     INT          NOT NULL,
+    student_b_id     INT          NOT NULL,
+    similarity_score FLOAT        NOT NULL,
+    llm_explanation  TEXT         NULL,
+    computed_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+    FOREIGN KEY (student_a_id)  REFERENCES users(id)       ON DELETE CASCADE,
+    FOREIGN KEY (student_b_id)  REFERENCES users(id)       ON DELETE CASCADE,
+    UNIQUE KEY uq_plagiarism_pair (assessment_id, feature_name, student_a_id, student_b_id),
+    INDEX idx_plagiarism_assessment (assessment_id, feature_name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

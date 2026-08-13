@@ -98,6 +98,12 @@ from auth import (
     is_email_unique_for_update,
     update_user_api_keys,
     update_user_model_prefs,
+    generate_temp_password,
+    send_temp_password_email,
+    request_password_reset,
+    get_smtp_config,
+    set_smtp_config,
+    send_email,
 )
 import json
 import time as _time
@@ -113,6 +119,9 @@ from src.features.student_wellness.student_wellness_feature import student_welln
 from src.features.quiz_generator.quiz_generator_feature import quiz_generator_ui
 from src.features.oral_examination.oral_examination_feature import oral_examination_ui
 from src.features.narrated_slideshow.narrated_slideshow_feature import render_narrated_slideshow_feature
+from src.utils.roster_import import parse_roster_file, validate_roster, commit_roster, resend_login_credentials
+from src.utils.gradebook import build_course_gradebook
+from src.utils.plagiarism import run_plagiarism_scan, get_plagiarism_results, SIMILARITY_FLAG_THRESHOLD
 from src.features.proctoring.proctoring_feature import (
     cleanup_old_proctor_data,
     process_pending_proctor_analysis,
@@ -948,29 +957,61 @@ def dialog_edit_user(user_row):
 
 
 @st.dialog("Reset Password")
-def dialog_reset_password(user_id: int, username: str):
+def dialog_reset_password(user_id: int, username: str, email: str = None, first_name: str = None):
     """
-    Admin password reset form presented as a modal dialog.
-    The admin sets a new password directly without requiring the current one.
-    Password strength is validated via validators.py before writing.
+    Admin password reset, presented as a modal dialog with two paths:
+
+      - Generate & Email (default): generates a temp password, sets it,
+        flags must_change_password so the user is forced to choose their own
+        on next login, and emails it to them (requires SMTP to be configured
+        in Admin Panel -> Settings).
+      - Set Manually: the admin types a password directly, as before — no
+        email sent, no forced change.
     """
     st.subheader(f"Reset password for: {username}")
-    with st.form("dialog_reset_pwd_form"):
-        new_pwd  = st.text_input("New Password", type="password")
-        conf_pwd = st.text_input("Confirm New Password", type="password")
-        submit   = st.form_submit_button("Update Password", type="primary")
+    mode = st.radio(
+        "Method",
+        ["Generate & Email", "Set Manually"],
+        help="Generate & Email creates a random temp password, emails it to "
+             "the user, and forces them to set their own password at next login.",
+    )
 
-    if submit:
-        # Passwords are not stripped — whitespace is intentional.
-        pwd_err = validate_password(new_pwd)
-        if pwd_err:
-            st.error(pwd_err)
-        elif new_pwd != conf_pwd:
-            st.error("Passwords do not match.")
-        else:
-            admin_reset_user_password(user_id, new_pwd)
-            st.toast(f"Password for '{username}' updated.")
+    if mode == "Generate & Email":
+        if not email:
+            st.error("This user has no email address on file — use Set Manually instead.")
+            return
+        st.caption(f"A temporary password will be emailed to {email}.")
+        if st.button("Generate & Send", type="primary"):
+            temp_pwd = generate_temp_password()
+            admin_reset_user_password(user_id, temp_pwd, must_change=True)
+            try:
+                send_temp_password_email(
+                    {"username": username, "email": email, "first_name": first_name or ""},
+                    temp_pwd,
+                )
+                st.toast(f"Temporary password emailed to {email}.")
+            except RuntimeError as exc:
+                st.error(
+                    f"Password was reset, but the email could not be sent: {exc}"
+                )
             st.rerun()
+    else:
+        with st.form("dialog_reset_pwd_form"):
+            new_pwd  = st.text_input("New Password", type="password")
+            conf_pwd = st.text_input("Confirm New Password", type="password")
+            submit   = st.form_submit_button("Update Password", type="primary")
+
+        if submit:
+            # Passwords are not stripped — whitespace is intentional.
+            pwd_err = validate_password(new_pwd)
+            if pwd_err:
+                st.error(pwd_err)
+            elif new_pwd != conf_pwd:
+                st.error("Passwords do not match.")
+            else:
+                admin_reset_user_password(user_id, new_pwd)
+                st.toast(f"Password for '{username}' updated.")
+                st.rerun()
 
 
 @st.dialog("Delete Course")
@@ -1307,7 +1348,7 @@ def _render_login_form():
     preferences fall back to the first model in llm_utils.MODELS.
     """
     with st.form("login_form"):
-        username = st.text_input("Username")
+        username = st.text_input("Username or Email")
         password = st.text_input("Password", type="password")
         submit   = st.form_submit_button("Log In", type="primary", width="stretch")
 
@@ -1342,6 +1383,32 @@ def _render_login_form():
             st.rerun()
         else:
             st.error("Invalid username or password. Please try again.")
+
+    with st.expander("Forgot password?"):
+        st.caption(
+            "Enter the email address on your account. If it matches an "
+            "active account, we'll email a new temporary password."
+        )
+        with st.form("forgot_password_form"):
+            forgot_email = st.text_input("Email")
+            forgot_submit = st.form_submit_button("Send Temporary Password")
+        if forgot_submit:
+            if not forgot_email.strip():
+                st.error("Enter an email address.")
+            else:
+                try:
+                    request_password_reset(forgot_email.strip())
+                except RuntimeError:
+                    # Email isn't configured yet. Deliberately still shows the
+                    # generic success message below — this endpoint never
+                    # reveals whether an account exists, and an admin needs
+                    # to fix SMTP configuration regardless of this specific
+                    # request's outcome.
+                    pass
+                st.success(
+                    "If that email matches an active account, a temporary "
+                    "password has been sent to it."
+                )
 
 
 def _load_model_preferences(user: dict) -> None:
@@ -2202,8 +2269,14 @@ def _admin_maintenance_tab():
     """
     Admin Panel → Maintenance tab.
 
-    Holds three sections:
+    Holds four sections:
 
+      0. Email (SMTP) Settings: Gmail sender credentials used to email temp
+         passwords to students (roster import, admin-triggered reset,
+         forgot-password self-service) — see get_smtp_config()/
+         set_smtp_config() in auth.py, stored in the single-row app_settings
+         table. The app functions normally with this unconfigured; email-
+         sending actions simply show a "not configured" error until set.
       1. Video Recording Quality: lets an admin pick the resolution/bitrate
          tier (VIDEO_QUALITY_PRESETS in proctoring_feature.py) applied to new
          proctoring screen/webcam recordings, persisted in the single-row
@@ -2232,6 +2305,47 @@ def _admin_maintenance_tab():
          nothing purges data unless an admin clicks the button (or an
          external scheduler calls the same function directly).
     """
+    st.subheader("Email (SMTP) Settings")
+    st.write(
+        "Gmail account used to send students their temporary passwords "
+        "(roster upload, admin-triggered reset, forgot-password self-"
+        "service). Requires a Gmail App Password, not the account "
+        "password — generate one at "
+        "[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) "
+        "after enabling 2-Step Verification."
+    )
+    current_sender, current_app_pwd = get_smtp_config()
+    with st.form("smtp_settings_form"):
+        smtp_email = st.text_input("Sending Gmail address", value=current_sender or "")
+        smtp_pwd   = st.text_input(
+            "Gmail App Password",
+            value=current_app_pwd or "",
+            type="password",
+            help="16-character App Password, not the regular account password.",
+        )
+        save_smtp = st.form_submit_button("Save Email Settings", type="primary")
+    if save_smtp:
+        set_smtp_config(smtp_email.strip(), smtp_pwd.strip())
+        st.success("Email settings saved.")
+        st.rerun()
+
+    if current_sender and current_app_pwd:
+        test_email = st.text_input("Send a test email to", key="smtp_test_email")
+        if st.button("Send Test Email") and test_email.strip():
+            try:
+                send_email(
+                    "Prebinary — Test Email",
+                    "This is a test email from Prebinary's Admin Panel settings.",
+                    test_email.strip(),
+                )
+                st.success(f"Test email sent to {test_email.strip()}.")
+            except Exception as exc:
+                st.error(f"Failed to send test email: {exc}")
+    else:
+        st.caption("Save valid credentials above to enable sending a test email.")
+
+    st.divider()
+
     st.subheader("Video Recording Quality")
     st.write(
         "Resolution and bitrate used for the continuous screen and webcam "
@@ -2312,6 +2426,71 @@ def _admin_maintenance_tab():
             f"{result['video_segments_deleted']} video segment record(s), and "
             f"removed {result['files_removed']} image/audio/video file(s) from disk."
         )
+
+    st.divider()
+
+    st.subheader("Plagiarism Scan")
+    st.write(
+        "Compares every pair of students' submissions on one assessment "
+        "using the app's built-in local embedding model — no API key "
+        "required — and flags pairs above the similarity threshold with a "
+        "short AI-generated explanation. Run on-demand per assessment; "
+        "results persist until the next run."
+    )
+    engine = get_engine()
+    courses_df = pd.read_sql(text("SELECT id, course_name FROM courses ORDER BY course_name"), engine)
+    if courses_df.empty:
+        st.info("No courses exist yet.")
+    else:
+        course_options = {r["course_name"]: int(r["id"]) for _, r in courses_df.iterrows()}
+        sel_course = st.selectbox("Course", list(course_options.keys()), key="plag_course_sel")
+        sel_course_id = course_options[sel_course]
+
+        assessments_df = pd.read_sql(
+            text("SELECT id, title FROM assessments WHERE course_id = :cid ORDER BY title"),
+            engine, params={"cid": sel_course_id},
+        )
+        if assessments_df.empty:
+            st.info("This course has no assessments yet.")
+        else:
+            assessment_options = {r["title"]: int(r["id"]) for _, r in assessments_df.iterrows()}
+            sel_assessment = st.selectbox("Assessment", list(assessment_options.keys()), key="plag_assessment_sel")
+            sel_assessment_id = assessment_options[sel_assessment]
+
+            feature_labels = {
+                "exam_grading": "Exam Grading",
+                "oral_exam": "Oral Examination",
+                "practice_quiz": "Practice Quiz (short-answer questions)",
+            }
+            sel_feature = st.selectbox(
+                "Assessment type", list(feature_labels.keys()),
+                format_func=lambda k: feature_labels[k], key="plag_feature_sel",
+            )
+
+            if st.button("Run Plagiarism Scan", type="primary"):
+                with st.spinner("Comparing submissions..."):
+                    try:
+                        summary = run_plagiarism_scan(sel_assessment_id, sel_feature)
+                        st.success(
+                            f"Checked {summary['pairs_checked']} pair(s), "
+                            f"flagged {summary['pairs_flagged']} above the similarity threshold."
+                        )
+                    except Exception as exc:
+                        st.error(f"Plagiarism scan failed: {exc}")
+
+            flagged = get_plagiarism_results(sel_assessment_id, sel_feature)
+            if flagged:
+                st.markdown(f"**Flagged pairs (similarity ≥ {int(SIMILARITY_FLAG_THRESHOLD * 100)}%)**")
+                for pair in flagged:
+                    st.markdown(
+                        f"- **{pair['a_first']} {pair['a_last']}** ↔ "
+                        f"**{pair['b_first']} {pair['b_last']}** — "
+                        f"{pair['similarity_score'] * 100:.1f}% similar"
+                    )
+                    if pair.get("llm_explanation"):
+                        st.caption(pair["llm_explanation"])
+            else:
+                st.caption("No flagged pairs for this assessment yet — run a scan above.")
 
 
 def _admin_users_tab(engine):
@@ -2514,7 +2693,13 @@ def _admin_users_tab(engine):
 
         selected_rows = selection.selection.rows if selection.selection else []
 
-        if selected_rows:
+        if selected_rows and selected_rows[0] >= len(df):
+            # The selection widget's key persists this row index across
+            # reruns, but df is refetched fresh every time — if the table
+            # shrank since the index was recorded (e.g. the previously
+            # selected user was just deleted), it can point past the end.
+            st.info("That selection is no longer valid — the user list has changed. Please select a row again.")
+        elif selected_rows:
             row_idx   = selected_rows[0]
             user_row  = df.iloc[row_idx]
             u_id      = int(user_row["id"])
@@ -2526,7 +2711,11 @@ def _admin_users_tab(engine):
                     dialog_edit_user(user_row)
             with btn2:
                 if st.button("Reset Password", width="stretch"):
-                    dialog_reset_password(u_id, uname_sel)
+                    dialog_reset_password(
+                        u_id, uname_sel,
+                        email=user_row.get("email"),
+                        first_name=user_row.get("first_name"),
+                    )
             with btn3:
                 if st.button("Delete User", type="primary", width="stretch"):
                     dialog_delete_user(u_id, uname_sel)
@@ -2931,6 +3120,198 @@ def _admin_courses_tab(engine):
                 st.error(f"Bulk update failed: {exc}")
 
 
+def _render_student_roster_panel(course_id: int, tab_key=None):
+    """
+    Student roster management for a single course: bulk CSV/Excel upload
+    with a validate-then-commit preview, plus manual single-student add,
+    edit, and remove. Lives inside _render_course_access_panel(), gated by
+    the same can_manage_sharing permission check that panel already applies.
+
+    Session state keys are namespaced by tab_key + course_id, matching the
+    rest of _render_course_access_panel(), so this panel can render inside
+    multiple tabs at once without collisions.
+    """
+    ns = f"{tab_key}_{course_id}" if tab_key else f"{course_id}"
+    upload_key = f"roster_upload_df_{ns}"
+
+    with st.expander("Upload Roster (CSV / Excel)"):
+        st.caption(
+            "Columns expected: First Name, Last Name, ID Number, Email. "
+            "Students whose email matches an existing account are enrolled "
+            "directly; new emails get a new account with a temporary "
+            "password emailed to them."
+        )
+        uploaded = st.file_uploader(
+            "Roster file", type=["csv", "xlsx", "xls"], key=f"roster_file_{ns}"
+        )
+        if uploaded is not None and st.button("Preview Roster", key=f"roster_preview_btn_{ns}"):
+            try:
+                parsed = parse_roster_file(uploaded)
+                st.session_state[upload_key] = validate_roster(parsed, course_id)
+            except ValueError as exc:
+                st.error(str(exc))
+
+        preview_df = st.session_state.get(upload_key)
+        if preview_df is not None and not preview_df.empty:
+            status_counts = preview_df["status"].value_counts().to_dict()
+            st.caption(
+                f"{status_counts.get('new', 0)} new account(s) · "
+                f"{status_counts.get('enroll_existing', 0)} existing account(s) to enroll · "
+                f"{status_counts.get('conflict', 0)} conflict(s) needing attention"
+            )
+            edited = st.data_editor(
+                preview_df,
+                key=f"roster_editor_{ns}",
+                hide_index=True,
+                width="stretch",
+                disabled=["status", "conflict_reason", "existing_user_id", "resolved_username"],
+                column_config={"include": st.column_config.CheckboxColumn("Include")},
+            )
+            update_existing = st.checkbox(
+                "Also update name/ID number on existing accounts that differ from the file",
+                key=f"roster_update_existing_{ns}",
+            )
+            col_recheck, col_commit = st.columns(2)
+            with col_recheck:
+                if st.button("Re-check Rows", key=f"roster_recheck_{ns}", width="stretch"):
+                    rechecked = validate_roster(
+                        edited[["first_name", "last_name", "id_number", "email"]], course_id
+                    )
+                    st.session_state[upload_key] = rechecked
+                    st.rerun()
+            with col_commit:
+                n_include = int(edited["include"].sum())
+                if st.button(f"Commit {n_include} Row(s)", type="primary", key=f"roster_commit_{ns}", width="stretch"):
+                    summary = commit_roster(edited, course_id, update_existing=update_existing)
+                    st.session_state.pop(upload_key, None)
+                    msg = (
+                        f"Enrolled {summary['enrolled_existing']} existing student(s), "
+                        f"created {summary['created_new']} new account(s), "
+                        f"skipped {summary['skipped']} row(s)."
+                    )
+                    if summary.get("email_failed"):
+                        msg += f" {summary['email_failed']} temp-password email(s) failed to send — check Admin Panel → Settings."
+                    st.success(msg)
+                    if summary.get("failed"):
+                        st.error(
+                            f"{len(summary['failed'])} row(s) could not be committed:\n\n"
+                            + "\n".join(f"- {f['name']}: {f['reason']}" for f in summary["failed"])
+                            + "\n\nFix these rows and re-upload just those students."
+                        )
+                    st.rerun()
+
+    with st.expander("Add a Single Student"):
+        with st.form(f"add_single_student_form_{ns}"):
+            c1, c2 = st.columns(2)
+            m_first = c1.text_input("First Name")
+            m_last  = c2.text_input("Last Name")
+            m_id    = c1.text_input("ID Number")
+            m_email = c2.text_input("Email")
+            add_submit = st.form_submit_button("Add Student", type="primary")
+
+        if add_submit:
+            row_df = pd.DataFrame([{
+                "first_name": m_first.strip(), "last_name": m_last.strip(),
+                "id_number": m_id.strip(), "email": m_email.strip(),
+            }])
+            validated = validate_roster(row_df, course_id)
+            row = validated.iloc[0]
+            if row["status"] == "conflict":
+                st.error(row["conflict_reason"] or "Could not add this student.")
+            else:
+                summary = commit_roster(validated, course_id)
+                if summary["created_new"]:
+                    st.success(f"Created and enrolled {m_first} {m_last}.")
+                elif summary["enrolled_existing"]:
+                    st.success(f"Enrolled existing account for {m_first} {m_last}.")
+                elif summary.get("failed"):
+                    st.error(f"Could not add {m_first} {m_last}: {summary['failed'][0]['reason']}")
+                st.rerun()
+
+    with st.expander("Edit or Remove an Enrolled Student"):
+        conn_engine = get_engine()
+        enrolled_df = pd.read_sql(
+            text("""
+                SELECT u.id, u.username, u.first_name, u.last_name, u.roll_no, u.email
+                FROM course_access ca
+                JOIN users u ON u.id = ca.user_id
+                WHERE ca.course_id = :cid AND ca.access_role = 'student' AND ca.status = 'approved'
+                ORDER BY u.last_name, u.first_name
+            """),
+            conn_engine,
+            params={"cid": int(course_id)},
+        )
+        if enrolled_df.empty:
+            st.info("No students currently enrolled.")
+        else:
+            options = {
+                f"{r.first_name} {r.last_name} ({r.email})": int(r.id)
+                for r in enrolled_df.itertuples(index=False)
+            }
+            sel = st.selectbox("Student", ["-- Select --"] + list(options.keys()), key=f"roster_edit_sel_{ns}")
+            matched_row = enrolled_df[enrolled_df["id"] == options.get(sel)] if sel != "-- Select --" else None
+            if matched_row is not None and matched_row.empty:
+                # sel is stale — e.g. this student was just removed via the
+                # dialog below and the page rerun, but the selectbox widget's
+                # session-state value hasn't caught up to the refreshed
+                # roster yet. Not an error the instructor needs to see.
+                st.info("That student is no longer enrolled. Pick another from the list above.")
+            elif matched_row is not None:
+                sel_id = options[sel]
+                sel_row = matched_row.iloc[0]
+                with st.form(f"edit_student_form_{ns}"):
+                    e1, e2 = st.columns(2)
+                    e_first = e1.text_input("First Name", value=sel_row["first_name"] or "")
+                    e_last  = e2.text_input("Last Name", value=sel_row["last_name"] or "")
+                    e_id    = st.text_input("ID Number", value=sel_row["roll_no"] or "")
+                    save_edit = st.form_submit_button("Save Changes", type="primary")
+                if save_edit:
+                    update_user_profile(
+                        sel_id, first_name=e_first, last_name=e_last, phone=None,
+                        street=None, city=None, state_prov=None, postal_code=None,
+                        country=None, roll_no=e_id or None,
+                    )
+                    st.toast("Student updated.")
+                    st.rerun()
+
+                edit_btn1, edit_btn2 = st.columns(2)
+                with edit_btn1:
+                    if st.button("Send Login Email", key=f"roster_email_one_{ns}", width="stretch"):
+                        result = resend_login_credentials([sel_id])
+                        if result["sent"]:
+                            st.success(f"Emailed a new temporary password to {sel_row['email']}.")
+                        else:
+                            reason = result["failed"][0]["reason"] if result["failed"] else "unknown error"
+                            st.error(f"Could not send email: {reason}")
+                with edit_btn2:
+                    if st.button("Remove from Course", key=f"roster_remove_{ns}", width="stretch"):
+                        dialog_revoke_access(conn_engine, course_id, sel_id, sel_row["username"], "student")
+
+    all_students_df = pd.read_sql(
+        text("""
+            SELECT u.id
+            FROM course_access ca
+            JOIN users u ON u.id = ca.user_id
+            WHERE ca.course_id = :cid AND ca.access_role = 'student' AND ca.status = 'approved'
+        """),
+        get_engine(),
+        params={"cid": int(course_id)},
+    )
+    if not all_students_df.empty:
+        if st.button(
+            f"Email Login Credentials to All {len(all_students_df)} Enrolled Student(s)",
+            key=f"roster_email_all_{ns}",
+        ):
+            with st.spinner("Sending emails..."):
+                result = resend_login_credentials(all_students_df["id"].astype(int).tolist())
+            msg = f"Sent {result['sent']} email(s)."
+            if result["failed"]:
+                msg += f" {len(result['failed'])} failed."
+            st.success(msg)
+            if result["failed"]:
+                st.error("\n".join(f"- {f['name']}: {f['reason']}" for f in result["failed"]))
+
+
 def _render_course_access_panel(engine, course_id: int, tab_key=None):
     """
     Access management panel for a single course.
@@ -2998,6 +3379,27 @@ def _render_course_access_panel(engine, course_id: int, tab_key=None):
         shared_student_ids = set(
             active_access.loc[active_access["access_role"] == "student", "user_id"].astype(int).tolist()
         )
+
+    st.markdown("**Student Roster**")
+    _render_student_roster_panel(course_id, tab_key)
+    st.divider()
+
+    st.markdown("**Gradebook**")
+    gb_key = f"gradebook_dl_{tab_key}_{course_id}" if tab_key else f"gradebook_dl_{course_id}"
+    if st.button("Generate Full Gradebook (CSV)", key=gb_key):
+        gradebook_df = build_course_gradebook(course_id)
+        if gradebook_df.empty:
+            st.info("No enrolled students to include in a gradebook yet.")
+        else:
+            st.download_button(
+                "Download Gradebook CSV",
+                data=gradebook_df.to_csv(index=False),
+                file_name=f"gradebook_course_{course_id}.csv",
+                mime="text/csv",
+                key=f"{gb_key}_download",
+            )
+            st.dataframe(gradebook_df, hide_index=True, width="stretch")
+    st.divider()
 
     st.markdown("**Share Course Access**")
     col_t, col_s = st.columns(2)
@@ -4379,6 +4781,54 @@ def _render_student_quiz_view(engine, a_id: int):
 
 
 # =============================================================================
+# FORCED PASSWORD CHANGE
+# =============================================================================
+# Shown instead of any normal navigation whenever the logged-in user's
+# must_change_password flag is set — i.e. they logged in with a system-
+# generated temp password (roster import, admin-triggered reset email,
+# forgot-password self-service) and have not yet chosen their own password.
+
+def _render_forced_password_change():
+    """
+    Full-screen mandatory change-password form. No sidebar, no other nav —
+    the user cannot use the app until this is completed.
+    """
+    _, centre, _ = st.columns([1, 2, 1])
+    with centre:
+        st.markdown("## Set a New Password")
+        st.info(
+            "You're logging in with a temporary password. Choose a new "
+            "password to continue."
+        )
+        with st.form("forced_password_change_form"):
+            cur_p = st.text_input("Temporary Password", type="password")
+            new_p = st.text_input("New Password", type="password")
+            con_p = st.text_input("Confirm New Password", type="password")
+            submit = st.form_submit_button("Set Password", type="primary", width="stretch")
+
+        if submit:
+            user = st.session_state.user
+            valid = login_user(user["username"], cur_p)
+            if not valid or valid == "inactive":
+                st.error("Temporary password is incorrect.")
+            else:
+                pwd_err = validate_password(new_p)
+                if pwd_err:
+                    st.error(pwd_err)
+                elif new_p != con_p:
+                    st.error("New passwords do not match.")
+                else:
+                    change_user_password(user["id"], new_p)
+                    st.session_state.user["must_change_password"] = 0
+                    st.toast("Password updated.")
+                    st.rerun()
+
+        if st.button("Log Out Instead"):
+            logout()
+            st.rerun()
+
+
+# =============================================================================
 # SESSION TIMEOUT
 # =============================================================================
 # Checks whether the authenticated session has been idle for longer than
@@ -4425,7 +4875,11 @@ if st.session_state.logged_in:
 
     # Re-check after potential timeout logout — _check_session_timeout() may
     # have cleared logged_in via logout().
-    if st.session_state.get("logged_in"):
+    if st.session_state.get("logged_in") and st.session_state.user.get("must_change_password"):
+        # Forced password change takes over the entire screen — no sidebar,
+        # no other nav — until the user sets their own password.
+        _render_forced_password_change()
+    elif st.session_state.get("logged_in"):
         render_sidebar()
         page = st.session_state.current_page
         role = st.session_state.user.get("role")

@@ -26,8 +26,10 @@ import bcrypt
 import json
 import os
 import random
+import secrets
 import smtplib
 import ssl
+import string
 import uuid
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -290,44 +292,110 @@ def verify_password(password: str, hashed: str) -> bool:
 
 
 # =============================================================================
-# EMAIL VERIFICATION UTILITIES
+# EMAIL UTILITIES
 # =============================================================================
-# These utilities support email-based verification of new user accounts.
+# Generic email sending, used for signup verification codes, temp-password
+# notifications (roster import, admin-triggered reset), and self-service
+# forgot-password resets.
 #
-# Currently, email verification is NOT enforced during signup. New accounts
-# are created immediately and placed into 'inactive' status, requiring an
-# administrator to activate them manually. This module is included so that
-# email verification can be enabled in a future sprint without restructuring
-# the authentication flow — only the caller in app.py needs to be updated.
+# SMTP sender credentials are stored in the single-row app_settings table so
+# an admin can configure them at runtime from Admin Panel -> Settings without
+# editing source or redeploying — see get_smtp_config()/set_smtp_config().
+# As a deployment convenience, the SMTP_SENDER_EMAIL/SMTP_APP_PASSWORD
+# environment variables are used as a fallback when app_settings is blank
+# (e.g. Docker Compose .env). If neither is configured, send_email() raises
+# a RuntimeError so callers can surface a clear "not configured" message
+# instead of failing silently.
 #
-# To activate email verification:
-#   1. Configure SMTP_SENDER_EMAIL and SMTP_APP_PASSWORD below with a valid
-#      Gmail address and its corresponding App Password (not the account
-#      password). App Passwords are generated at:
-#      https://myaccount.google.com/apppasswords
-#   2. Enable 2-Step Verification on the Gmail account first.
-#   3. In _render_signup_form() (app.py), call send_verification_email() after
-#      form submission and gate the signup_user() call on verify_email_code().
+# To configure: open Admin Panel -> Settings, or set SMTP_SENDER_EMAIL /
+# SMTP_APP_PASSWORD in the app's environment. Gmail App Passwords (not the
+# account password) are generated at https://myaccount.google.com/apppasswords
+# after enabling 2-Step Verification on the sending account.
 # =============================================================================
 
-# SMTP configuration for Gmail. Both values must be populated before email
-# verification can be used. Left empty so the module loads safely without
-# credentials configured.
-SMTP_SERVER       = "smtp.gmail.com"
-SMTP_PORT         = 465          # SSL
-SMTP_SENDER_EMAIL = ""           # Set to the sending Gmail address
-SMTP_APP_PASSWORD = ""           # Set to the Gmail App Password, not the account password
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT   = 465  # SSL
+
+
+def get_smtp_config() -> tuple:
+    """
+    Return (sender_email, app_password) for outgoing mail.
+
+    Checks the app_settings table first (admin-configured at runtime), then
+    falls back to the SMTP_SENDER_EMAIL/SMTP_APP_PASSWORD environment
+    variables. Returns ("", "") if neither source has a value.
+    """
+    conn   = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT smtp_sender_email, smtp_app_password FROM app_settings WHERE id = 1")
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+    sender_email = (row and row.get("smtp_sender_email")) or os.environ.get("SMTP_SENDER_EMAIL", "")
+    app_password = (row and row.get("smtp_app_password")) or os.environ.get("SMTP_APP_PASSWORD", "")
+    return sender_email, app_password
+
+
+def set_smtp_config(sender_email: str, app_password: str) -> None:
+    """Persist admin-configured SMTP sender credentials to app_settings."""
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO app_settings (id, smtp_sender_email, smtp_app_password)
+            VALUES (1, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                smtp_sender_email = VALUES(smtp_sender_email),
+                smtp_app_password = VALUES(smtp_app_password)
+            """,
+            (sender_email, app_password),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def send_email(subject: str, body: str, receiver_email: str) -> None:
+    """
+    Send a plain-text email via Gmail SMTP over SSL.
+
+    Args:
+        subject: Email subject line.
+        body: Plain-text email body.
+        receiver_email: The address to send to.
+
+    Raises:
+        RuntimeError: If SMTP credentials are not configured (via app_settings
+            or environment variables).
+        smtplib.SMTPException: If the email cannot be delivered.
+    """
+    sender_email, app_password = get_smtp_config()
+    if not sender_email or not app_password:
+        raise RuntimeError(
+            "Email is not configured yet. An administrator must set the "
+            "sending Gmail address and App Password from Admin Panel → Settings."
+        )
+
+    msg            = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"]    = sender_email
+    msg["To"]      = receiver_email
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+        server.login(sender_email, app_password)
+        server.sendmail(sender_email, receiver_email, msg.as_string())
 
 
 def send_verification_email(receiver_email: str) -> str:
     """
     Send a six-digit verification code to the given email address and return
     the code so the caller can store it for later comparison.
-
-    Uses Gmail SMTP over SSL. SMTP_SENDER_EMAIL and SMTP_APP_PASSWORD must be
-    configured above before this function will work. If either value is empty
-    the function raises a RuntimeError so the caller can surface a clear error
-    rather than failing silently.
 
     Args:
         receiver_email: The address to send the verification code to.
@@ -340,25 +408,54 @@ def send_verification_email(receiver_email: str) -> str:
         RuntimeError: If SMTP credentials are not configured.
         smtplib.SMTPException: If the email cannot be delivered.
     """
-    if not SMTP_SENDER_EMAIL or not SMTP_APP_PASSWORD:
-        raise RuntimeError(
-            "Email verification is not configured. "
-            "Set SMTP_SENDER_EMAIL and SMTP_APP_PASSWORD in auth.py."
-        )
-
     code = str(random.randint(100000, 999999))
-
-    msg             = MIMEText(f"Your Prebinary verification code is: {code}")
-    msg["Subject"]  = "Prebinary — Email Verification Code"
-    msg["From"]     = SMTP_SENDER_EMAIL
-    msg["To"]       = receiver_email
-
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
-        server.login(SMTP_SENDER_EMAIL, SMTP_APP_PASSWORD)
-        server.sendmail(SMTP_SENDER_EMAIL, receiver_email, msg.as_string())
-
+    send_email(
+        "Prebinary — Email Verification Code",
+        f"Your Prebinary verification code is: {code}",
+        receiver_email,
+    )
     return code
+
+
+def generate_temp_password(length: int = 12) -> str:
+    """
+    Return a random temporary password (well above the app's 8-character
+    minimum in app_validators.validate_password), mixing uppercase,
+    lowercase, digits, and a special character for reasonable strength.
+    """
+    upper   = secrets.choice(string.ascii_uppercase)
+    lower   = secrets.choice(string.ascii_lowercase)
+    digit   = secrets.choice(string.digits)
+    special = secrets.choice("!@#$%^&*")
+    rest_len = max(length - 4, 4)
+    rest = "".join(
+        secrets.choice(string.ascii_letters + string.digits) for _ in range(rest_len)
+    )
+    password = list(upper + lower + digit + special + rest)
+    secrets.SystemRandom().shuffle(password)
+    return "".join(password)
+
+
+def send_temp_password_email(user: dict, temp_password: str) -> None:
+    """
+    Email a student their username and a newly generated temporary password.
+
+    Args:
+        user: A user row dict with at least "username" and "email".
+        temp_password: The plaintext temp password (already set on the
+            account by the caller — this function only sends the email).
+    """
+    body = (
+        f"Hello {user.get('first_name', '')},\n\n"
+        f"An account has been set up for you on Prebinary.\n\n"
+        f"Username: {user['username']}\n"
+        f"Email: {user['email']}\n"
+        f"Temporary password: {temp_password}\n\n"
+        f"Log in and you will be asked to set your own password before "
+        f"continuing.\n\n"
+        f"— Prebinary"
+    )
+    send_email("Prebinary — Your Account & Temporary Password", body, user["email"])
 
 
 def verify_email_code(user_input: str, expected_code: str) -> bool:
@@ -430,17 +527,25 @@ def login_user(username: str, password: str):
     """
     Verify login credentials and return the user record on success.
 
+    `username` may be either the account's username or its email address —
+    students are onboarded via email (roster import, temp-password email) and
+    naturally log in with whichever one they were given.
+
     Returns:
         dict   — the full user row (password field removed) on successful login.
         "inactive" — if credentials are correct but the account is not active.
-        None   — if the username does not exist or the password is incorrect.
+        None   — if no account matches, or the password is incorrect.
 
     The password field is removed from the returned dict so it is never stored
     in Streamlit session state.
     """
+    identifier = username.strip()
     conn   = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE username = %s", (username.strip(),))
+    cursor.execute(
+        "SELECT * FROM users WHERE username = %s OR email = %s",
+        (identifier, identifier),
+    )
     user = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -520,12 +625,14 @@ def change_user_password(user_id: int, new_password: str) -> None:
     Hash and store a new password for a user changing their own password.
 
     The current password is verified by the caller (app.py) before this
-    function is invoked. Passwords are never stripped before hashing.
+    function is invoked. Passwords are never stripped before hashing. Also
+    clears must_change_password, since the user has now set their own
+    password — this is the only place that flag is cleared.
     """
     conn   = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE users SET password = %s WHERE id = %s",
+        "UPDATE users SET password = %s, must_change_password = 0 WHERE id = %s",
         (hash_password(new_password), user_id),
     )
     conn.commit()
@@ -533,23 +640,63 @@ def change_user_password(user_id: int, new_password: str) -> None:
     conn.close()
 
 
-def admin_reset_user_password(user_id: int, new_password: str) -> None:
+def admin_reset_user_password(user_id: int, new_password: str, must_change: bool = False) -> None:
     """
     Hash and store a new password on behalf of a user, initiated by an admin.
 
     Unlike change_user_password(), no verification of the existing password
     is required. Validation of the new password's strength is performed by
     the caller in app.py before this function is invoked.
+
+    Args:
+        must_change: When True (e.g. a generated temp password emailed to the
+            user), sets must_change_password so the user is forced to set
+            their own password on next login.
     """
     conn   = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE users SET password = %s WHERE id = %s",
-        (hash_password(new_password), user_id),
+        "UPDATE users SET password = %s, must_change_password = %s WHERE id = %s",
+        (hash_password(new_password), 1 if must_change else 0, user_id),
     )
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def request_password_reset(email: str) -> None:
+    """
+    Self-service "forgot password": if an active account matches the given
+    email, generate a new temp password, set must_change_password, and email
+    it. Deliberately silent (no exception, no return value) whether or not a
+    match was found — the caller (app.py) always shows the same generic
+    success message, so this endpoint can't be used to discover which
+    emails have accounts.
+
+    Raises:
+        RuntimeError: If SMTP credentials are not configured (a real account
+            was found but the email could not be sent — the caller should
+            still not reveal account existence, but does need to know the
+            operation didn't actually complete).
+    """
+    conn   = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT id, username, email, first_name FROM users WHERE email = %s AND status = 'active'",
+            (email.strip(),),
+        )
+        user = cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+    if not user:
+        return
+
+    temp_password = generate_temp_password()
+    admin_reset_user_password(user["id"], temp_password, must_change=True)
+    send_temp_password_email(user, temp_password)
 
 
 def delete_user_account(user_id: int) -> None:
@@ -807,7 +954,8 @@ def admin_create_user(
     pref_quiz_generator: str  = None,
     pref_video_lectures: str  = None,
     roll_no: str              = None,
-) -> None:
+    must_change_password: bool = False,
+) -> int:
     """
     Insert a new user record created directly by an admin.
 
@@ -815,6 +963,13 @@ def admin_create_user(
     model preferences at creation time. API keys and model preferences are
     optional and default to None (stored as NULL), which causes each feature to
     fall back to the first model in llm_utils.MODELS at login.
+
+    must_change_password should be True whenever `password` is a system-
+    generated temp password (e.g. roster import) rather than one the user
+    chose themselves, forcing a change-password screen on their first login.
+
+    Returns:
+        The new user's id (cursor.lastrowid).
     """
     conn   = get_connection()
     cursor = conn.cursor()
@@ -828,14 +983,14 @@ def admin_create_user(
                 roll_no,
                 chatgpt_api_key, gemini_api_key, groq_api_key,
                 github_token, elevenlabs_api_key, cartesia_api_key,
-                role, status,
+                role, status, must_change_password,
                 pref_model_rag, pref_model_exam_grading, pref_model_exam_creation,
                 pref_model_advisor_ai, pref_model_wellness,
                 pref_model_quiz_generator, pref_model_video_lectures
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s)
             """,
             (
@@ -859,6 +1014,7 @@ def admin_create_user(
                 cartesia_key,
                 role,
                 status,
+                1 if must_change_password else 0,
                 pref_rag,
                 pref_exam_grading,
                 pref_exam_creation,
@@ -869,6 +1025,7 @@ def admin_create_user(
             ),
         )
         conn.commit()
+        return cursor.lastrowid
     finally:
         cursor.close()
         conn.close()

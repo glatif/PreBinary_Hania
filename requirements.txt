@@ -23,6 +23,7 @@ streamlit
 
 # ── Data manipulation and SQL ─────────────────────────────────────────────────
 pandas
+openpyxl  # required by pandas.read_excel() for .xlsx roster uploads
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
