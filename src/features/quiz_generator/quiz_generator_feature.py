@@ -60,10 +60,16 @@ from src.features.quiz_generator.quiz_generator import (
     create_word_document_questions_only,
     create_word_document_with_answers,
 )
-from src.features.exam_verification.exam_verification_feature import verify_student_identity
+from src.features.exam_verification.exam_verification_feature import (
+    verify_student_identity,
+    get_verification_admin_settings,
+    effective_require_verification,
+)
 from src.utils.attempt_log import log_attempt_event, get_incomplete_attempts
 from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
+    get_proctoring_admin_lock,
+    effective_enable_proctoring,
     get_proctor_summary,
     get_proctor_frames,
     get_proctor_webcam_summary,
@@ -78,6 +84,67 @@ from src.features.proctoring.proctoring_feature import (
     get_or_build_proctor_video,
     get_or_build_combined_proctor_video,
 )
+
+
+# =============================================================================
+# DATABASE WRITE OPERATIONS — quiz settings (identity verification / proctoring)
+# =============================================================================
+# Unlike Exam Grading and Oral Exam, Practice Quiz has no other instructor
+# "setup" step to attach these two toggles to — quizzes are generated ad hoc
+# by students under an assessment, not authored by an instructor. This is a
+# small standalone table instead, upserted from the "Quiz Settings" panel in
+# render_instructor_attempts_tab() below.
+
+def save_quiz_generator_settings(
+    assessment_id: int, require_verification: bool, enable_proctoring: bool, set_by: int
+) -> None:
+    """Persist the instructor's per-assessment verification/proctoring toggles for Practice Quiz."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO quiz_generator_settings (assessment_id, require_verification, enable_proctoring, set_by)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                require_verification = VALUES(require_verification),
+                enable_proctoring    = VALUES(enable_proctoring),
+                set_by               = VALUES(set_by)
+            """,
+            (assessment_id, int(require_verification), int(enable_proctoring), set_by),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_quiz_generator_settings(assessment_id: int) -> Dict:
+    """
+    Return the saved verification/proctoring settings for this assessment's
+    Practice Quiz, or {"require_verification": True, "enable_proctoring": True}
+    if an instructor has never saved settings for it — matching the always-on
+    behavior from before this table existed.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT require_verification, enable_proctoring FROM quiz_generator_settings "
+            "WHERE assessment_id = %s",
+            (assessment_id,),
+        )
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+    if not row:
+        return {"require_verification": True, "enable_proctoring": True}
+    return {
+        "require_verification": bool(row["require_verification"]),
+        "enable_proctoring": bool(row["enable_proctoring"]),
+    }
 
 
 # =============================================================================
@@ -847,9 +914,14 @@ def render_quiz_interface_tab() -> None:
     # a fresh verification is required if the student generates a new quiz.
     user = st.session_state.get("user", {})
     if user.get("role") == "student":
+        assessment_ctx = st.session_state.get("practice_quiz_selected_assessment") or {}
+        quiz_settings = get_quiz_generator_settings(assessment_ctx.get("id")) if assessment_ctx.get("id") else {
+            "require_verification": True, "enable_proctoring": True,
+        }
         quiz_gate_id = st.session_state.get("quiz_current_db_id") or "session"
         gate_key = f"practice_quiz_{quiz_gate_id}"
-        if not verify_student_identity(user, gate_key=gate_key):
+        verification_required = effective_require_verification(quiz_settings["require_verification"])
+        if verification_required and not verify_student_identity(user, gate_key=gate_key):
             return
 
         # Proctoring starts the instant verification passes, before any quiz
@@ -863,18 +935,20 @@ def render_quiz_interface_tab() -> None:
         # runs, so display_quiz_results() can still stamp it onto the saved
         # attempt row after monitoring has stopped.
         if not st.session_state.get("quiz_submitted"):
-            assessment_ctx = st.session_state.get("practice_quiz_selected_assessment") or {}
-            st.session_state["quiz_proctor_session_id"] = render_proctor_monitor(
-                gate_key=gate_key,
-                user=user,
-                quiz_id=st.session_state.get("quiz_current_db_id"),
-                assessment_id=assessment_ctx.get("id"),
-            )
+            if effective_enable_proctoring(quiz_settings["enable_proctoring"]):
+                st.session_state["quiz_proctor_session_id"] = render_proctor_monitor(
+                    gate_key=gate_key,
+                    user=user,
+                    quiz_id=st.session_state.get("quiz_current_db_id"),
+                    assessment_id=assessment_ctx.get("id"),
+                )
 
             # Logged once per gate (guarded so a rerun while the quiz is open
             # doesn't write duplicate rows) — this is what makes a quiz the
             # student opened but never submitted visible to the instructor
             # via get_incomplete_attempts(), instead of leaving no trace at all.
+            # Logged regardless of whether proctoring itself is enabled for
+            # this assessment.
             started_logged_key = f"quiz_started_logged_{gate_key}"
             if assessment_ctx.get("id") and not st.session_state.get(started_logged_key):
                 log_attempt_event(
@@ -1302,6 +1376,55 @@ def render_instructor_attempts_tab(assessment_id: int) -> None:
     a delete button inside. Only rendered for admin and teacher roles.
     """
     st.header("👩\u200d🏫 Student Attempts")
+
+    with st.expander("⚙️ Quiz Settings", expanded=False):
+        st.caption(
+            "Controls whether students must verify their identity and whether "
+            "proctoring (screen & camera recording) runs when they take a "
+            "practice quiz generated under this assessment."
+        )
+        current_settings = get_quiz_generator_settings(assessment_id)
+        admin_settings = get_verification_admin_settings()
+        admin_allows_verification = admin_settings["allow_instructor_verification_toggle"]
+        admin_allows_proctoring = get_proctoring_admin_lock()
+
+        verify_col, proctor_col = st.columns(2)
+        with verify_col:
+            qz_require_verification = st.checkbox(
+                "Require identity verification",
+                value=current_settings["require_verification"] and admin_allows_verification,
+                key=f"qz_require_verification_{assessment_id}",
+                disabled=not admin_allows_verification,
+                help=(
+                    "Students must show an ID card and a live selfie before taking a quiz."
+                    if admin_allows_verification else
+                    "Disabled by your administrator — identity verification cannot be "
+                    "required for any quiz right now."
+                ),
+            )
+        with proctor_col:
+            qz_enable_proctoring = st.checkbox(
+                "Enable proctoring (screen & camera recording)",
+                value=current_settings["enable_proctoring"] and admin_allows_proctoring,
+                key=f"qz_enable_proctoring_{assessment_id}",
+                disabled=not admin_allows_proctoring,
+                help=(
+                    "Records the student's screen, camera, microphone, tab switches, "
+                    "keystrokes, and mouse activity while they take a quiz."
+                    if admin_allows_proctoring else
+                    "Disabled by your administrator — proctoring cannot be enabled "
+                    "for any quiz right now."
+                ),
+            )
+        if st.button("💾 Save Quiz Settings", key=f"qz_save_settings_{assessment_id}"):
+            save_quiz_generator_settings(
+                assessment_id=assessment_id,
+                require_verification=qz_require_verification,
+                enable_proctoring=qz_enable_proctoring,
+                set_by=int(st.session_state["user"]["id"]),
+            )
+            st.success("Quiz settings saved.")
+            st.rerun()
 
     # Attempts that were opened but never submitted — see attempt_log.py.
     # Shown even when no student has submitted anything yet (an "everyone

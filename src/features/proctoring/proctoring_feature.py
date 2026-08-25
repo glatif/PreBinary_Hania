@@ -867,6 +867,95 @@ def set_proctor_video_quality(quality: str) -> None:
         conn.close()
 
 
+def get_record_webcam_video() -> bool:
+    """
+    Return whether the webcam camera stream (continuous video recording,
+    periodic frame snapshots, and face/gaze analysis) should be captured at
+    all during a proctored session. When False, only screen recording plus
+    tab/keystroke/mouse monitoring run — the browser is never asked for
+    camera permission. Microphone recording is independent of this setting.
+
+    Falls back to True (today's always-on behavior) if the row/column is
+    missing, e.g. the migration hasn't been applied yet.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT record_webcam_video FROM proctor_settings WHERE id = 1")
+        row = cursor.fetchone()
+        return bool(row[0]) if row else True
+    except Exception:
+        return True
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def set_record_webcam_video(enabled: bool) -> None:
+    """Persist the admin-selected webcam-recording on/off setting."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO proctor_settings (id, record_webcam_video) VALUES (1, %s)
+            ON DUPLICATE KEY UPDATE record_webcam_video = VALUES(record_webcam_video)
+            """,
+            (int(enabled),),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_proctoring_admin_lock() -> bool:
+    """
+    Return whether instructors are allowed to enable proctoring at all for
+    their own exams/quizzes/oral exams (allow_instructor_proctoring_toggle
+    in app_settings). Falls back to True (today's behavior) if the row/
+    column is missing, e.g. the migration hasn't been applied yet.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT allow_instructor_proctoring_toggle FROM app_settings WHERE id = 1")
+        row = cursor.fetchone()
+        return bool(row[0]) if row else True
+    except Exception:
+        return True
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def set_proctoring_admin_lock(enabled: bool) -> None:
+    """Persist whether instructors are allowed to enable proctoring at all."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO app_settings (id, allow_instructor_proctoring_toggle) VALUES (1, %s)
+            ON DUPLICATE KEY UPDATE allow_instructor_proctoring_toggle = VALUES(allow_instructor_proctoring_toggle)
+            """,
+            (int(enabled),),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def effective_enable_proctoring(per_exam_enable_proctoring: bool) -> bool:
+    """
+    Resolve whether proctoring should actually run, combining the
+    instructor's per-exam choice with the admin-level permission lock. An
+    admin lock always wins — see get_proctoring_admin_lock() above.
+    """
+    return bool(per_exam_enable_proctoring) and get_proctoring_admin_lock()
+
+
 def save_proctor_event(
     session_id: str,
     user_id: int,
@@ -3189,21 +3278,42 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
         "video_bits_per_second": video_quality_preset["bits_per_second"],
     }
 
+    # Same once-per-session fetch pattern as the quality tier above — an
+    # admin toggling this mid-session shouldn't tear down a webcam stream
+    # already in progress. When False, the webcam component below is never
+    # mounted at all, so the browser is never asked for camera permission.
+    webcam_key_setting = f"proctor_record_webcam_{gate_key}"
+    if webcam_key_setting not in st.session_state:
+        st.session_state[webcam_key_setting] = get_record_webcam_video()
+    webcam_recording_enabled = st.session_state[webcam_key_setting]
+
     if share_key not in st.session_state:
-        st.info(
-            "This quiz is monitored for academic integrity. Tab switches, "
-            "window focus changes, keys you press, and mouse activity on "
-            "this page are recorded automatically. You'll also be asked to "
-            "share your screen, enable your camera, and enable your "
-            "microphone below — your browser will show its own permission "
-            "dialog for each. Once granted, a continuous recording of your "
-            "screen and a continuous recording of your webcam (with audio "
-            "from your microphone) are saved for instructor review, "
-            "alongside periodic snapshots checked for your face being "
-            "absent, more than one face in frame, or looking away from the "
-            "screen for an extended period. Your microphone also stays on "
-            "for the whole quiz and is checked for human speech."
-        )
+        if webcam_recording_enabled:
+            st.info(
+                "This quiz is monitored for academic integrity. Tab switches, "
+                "window focus changes, keys you press, and mouse activity on "
+                "this page are recorded automatically. You'll also be asked to "
+                "share your screen, enable your camera, and enable your "
+                "microphone below — your browser will show its own permission "
+                "dialog for each. Once granted, a continuous recording of your "
+                "screen and a continuous recording of your webcam (with audio "
+                "from your microphone) are saved for instructor review, "
+                "alongside periodic snapshots checked for your face being "
+                "absent, more than one face in frame, or looking away from the "
+                "screen for an extended period. Your microphone also stays on "
+                "for the whole quiz and is checked for human speech."
+            )
+        else:
+            st.info(
+                "This quiz is monitored for academic integrity. Tab switches, "
+                "window focus changes, keys you press, and mouse activity on "
+                "this page are recorded automatically. You'll also be asked to "
+                "share your screen and enable your microphone below — your "
+                "browser will show its own permission dialog for each. Once "
+                "granted, a continuous recording of your screen is saved for "
+                "instructor review. Your microphone also stays on for the "
+                "whole quiz and is checked for human speech."
+            )
 
     # Mounted on every rerun, not just before the permission outcome is known
     # — it must stay mounted to keep receiving periodic "frame" trigger values
@@ -3237,33 +3347,38 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
         )
 
     # Same always-mounted pattern as the screen-share button above, for the
-    # webcam permission prompt and its periodic frame captures.
-    webcam_result = _webcam_monitor_button(
-        key=f"proctor_webcam_{session_id}",
-        data=video_quality_data,
-        on_webcam_change=lambda: None,
-        on_frame_change=lambda: None,
-        on_video_chunk_change=lambda: None,
-    )
-
-    if webcam_result.webcam is not None and webcam_key not in st.session_state:
-        outcome = webcam_result.webcam
-        granted = bool(outcome.get("granted"))
-        st.session_state[webcam_key] = "granted" if granted else "denied"
-        save_proctor_event(
-            session_id, user_id, quiz_id, assessment_id,
-            "webcam_granted" if granted else "webcam_denied",
+    # webcam permission prompt and its periodic frame captures — only when
+    # the admin has webcam recording enabled (see webcam_recording_enabled
+    # above). When disabled, this component is never mounted, so the browser
+    # never prompts for camera permission and no frames/video/face-gaze
+    # analysis are produced for this session.
+    if webcam_recording_enabled:
+        webcam_result = _webcam_monitor_button(
+            key=f"proctor_webcam_{session_id}",
+            data=video_quality_data,
+            on_webcam_change=lambda: None,
+            on_frame_change=lambda: None,
+            on_video_chunk_change=lambda: None,
         )
 
-    if webcam_result.frame is not None:
-        save_proctor_webcam_frame(session_id, user_id, quiz_id, assessment_id, webcam_result.frame.get("data"))
+        if webcam_result.webcam is not None and webcam_key not in st.session_state:
+            outcome = webcam_result.webcam
+            granted = bool(outcome.get("granted"))
+            st.session_state[webcam_key] = "granted" if granted else "denied"
+            save_proctor_event(
+                session_id, user_id, quiz_id, assessment_id,
+                "webcam_granted" if granted else "webcam_denied",
+            )
 
-    if webcam_result.video_chunk is not None:
-        chunk = webcam_result.video_chunk
-        save_proctor_video_segment(
-            session_id, user_id, quiz_id, assessment_id,
-            chunk.get("kind"), chunk.get("seq"), chunk.get("data"),
-        )
+        if webcam_result.frame is not None:
+            save_proctor_webcam_frame(session_id, user_id, quiz_id, assessment_id, webcam_result.frame.get("data"))
+
+        if webcam_result.video_chunk is not None:
+            chunk = webcam_result.video_chunk
+            save_proctor_video_segment(
+                session_id, user_id, quiz_id, assessment_id,
+                chunk.get("kind"), chunk.get("seq"), chunk.get("data"),
+            )
 
     # Same always-mounted pattern as the screen-share/webcam buttons above,
     # for the microphone permission prompt and its continuous recording (see
@@ -3342,11 +3457,17 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
             f"🔴 Monitoring active — {st.session_state[count_key]} "
             "tab-switch/focus warning(s) recorded this session."
         )
-    else:
+    elif webcam_recording_enabled:
         st.caption(
             "🟢 Monitoring active — tab switches, focus loss, keystrokes, "
             "mouse activity, and (once enabled) your camera and microphone "
             "are being recorded."
+        )
+    else:
+        st.caption(
+            "🟢 Monitoring active — tab switches, focus loss, keystrokes, "
+            "mouse activity, and (once enabled) your microphone are being "
+            "recorded."
         )
 
     return session_id

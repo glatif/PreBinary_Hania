@@ -40,10 +40,16 @@ from auth import save_uploaded_file, delete_physical_file
 
 from src.utils.llm_utils import MODELS, generate_llm_response, MODEL_PROVIDERS, strip_llm_json
 from src.utils.pdf_utils import extract_text_from_pdf, save_uploaded_pdf
-from src.features.exam_verification.exam_verification_feature import verify_student_identity
+from src.features.exam_verification.exam_verification_feature import (
+    verify_student_identity,
+    get_verification_admin_settings,
+    effective_require_verification,
+)
 from src.utils.access_gate import verify_access_code
 from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
+    get_proctoring_admin_lock,
+    effective_enable_proctoring,
     get_proctor_summary_by_user_assessment,
     get_proctor_frames_by_user_assessment,
     get_proctor_webcam_summary_by_user_assessment,
@@ -318,6 +324,8 @@ def save_exam_setup(
     max_points: int,
     set_by: int,
     access_code: str = None,
+    require_verification: bool = True,
+    enable_proctoring: bool = True,
 ) -> None:
     """
     Persist the canonical exam setup for an assessment so students can read
@@ -328,23 +336,36 @@ def save_exam_setup(
 
     access_code is optional — None/blank means students need no code to
     submit, matching the previous (pre-access-code) behavior.
+
+    require_verification/enable_proctoring are the instructor's per-exam
+    toggles for identity verification / proctoring, both defaulting to
+    enabled. The effective value honored at submission time also factors in
+    the admin-level lock — see effective_require_verification()/
+    effective_enable_proctoring().
     """
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             """
-            INSERT INTO exam_setups (assessment_id, questions, rubric, sub_rubric, max_points, access_code, set_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO exam_setups
+                (assessment_id, questions, rubric, sub_rubric, max_points, access_code,
+                 require_verification, enable_proctoring, set_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
-                questions   = VALUES(questions),
-                rubric      = VALUES(rubric),
-                sub_rubric  = VALUES(sub_rubric),
-                max_points  = VALUES(max_points),
-                access_code = VALUES(access_code),
-                set_by      = VALUES(set_by)
+                questions            = VALUES(questions),
+                rubric               = VALUES(rubric),
+                sub_rubric           = VALUES(sub_rubric),
+                max_points           = VALUES(max_points),
+                access_code          = VALUES(access_code),
+                require_verification = VALUES(require_verification),
+                enable_proctoring    = VALUES(enable_proctoring),
+                set_by               = VALUES(set_by)
             """,
-            (assessment_id, questions, rubric, sub_rubric, max_points, access_code or None, set_by),
+            (
+                assessment_id, questions, rubric, sub_rubric, max_points, access_code or None,
+                int(require_verification), int(enable_proctoring), set_by,
+            ),
         )
         conn.commit()
     finally:
@@ -358,7 +379,8 @@ def get_exam_setup(assessment_id: int) -> Dict:
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(
-            "SELECT questions, rubric, sub_rubric, max_points, access_code, updated_at "
+            "SELECT questions, rubric, sub_rubric, max_points, access_code, "
+            "require_verification, enable_proctoring, updated_at "
             "FROM exam_setups WHERE assessment_id = %s",
             (assessment_id,),
         )
@@ -417,17 +439,22 @@ def _render_student_exam_submission(
     if not verify_access_code(setup.get("access_code"), gate_key=gate_key):
         return
 
-    if not verify_student_identity(user, gate_key=gate_key):
+    verification_required = effective_require_verification(setup.get("require_verification", True))
+    if verification_required and not verify_student_identity(user, gate_key=gate_key):
         return
 
-    render_proctor_monitor(
-        gate_key=f"exam_grading_{assessment_id}",
-        user=user,
-        quiz_id=None,
-        assessment_id=assessment_id,
-    )
+    if effective_enable_proctoring(setup.get("enable_proctoring", True)):
+        render_proctor_monitor(
+            gate_key=f"exam_grading_{assessment_id}",
+            user=user,
+            quiz_id=None,
+            assessment_id=assessment_id,
+        )
 
-    st.success("Identity verified. You may now upload your exam.")
+    if verification_required:
+        st.success("Identity verified. You may now upload your exam.")
+    else:
+        st.info("You may now upload your exam.")
 
     existing = get_student_exam_submissions(assessment_id, student_id=int(user["id"]))
     if existing:
@@ -1163,6 +1190,17 @@ def exam_grading_ui() -> None:
     if "eg_access_code" not in st.session_state:
         existing_setup = get_exam_setup(assessment_id) or {}
         st.session_state.eg_access_code = existing_setup.get("access_code") or ""
+        # Default to enabled (True) for a brand-new setup — defaults are
+        # "1" (int) once a row exists, so `is not None` distinguishes "no
+        # saved setup yet" from an explicit prior 0/False.
+        st.session_state.eg_require_verification = (
+            bool(existing_setup["require_verification"])
+            if existing_setup.get("require_verification") is not None else True
+        )
+        st.session_state.eg_enable_proctoring = (
+            bool(existing_setup["enable_proctoring"])
+            if existing_setup.get("enable_proctoring") is not None else True
+        )
     # Tracks which input method is selected in the Setup Exam tab. Set to
     # "Enter questions manually" when setup is loaded from history so that
     # the loaded questions text is immediately visible in the text area.
@@ -1420,6 +1458,37 @@ def exam_grading_ui() -> None:
             help="If set, students must enter this code before they can submit. Leave blank to require no code.",
         )
 
+        admin_settings = get_verification_admin_settings()
+        admin_allows_verification = admin_settings["allow_instructor_verification_toggle"]
+        admin_allows_proctoring = get_proctoring_admin_lock()
+
+        verify_col, proctor_col = st.columns(2)
+        with verify_col:
+            st.session_state.eg_require_verification = st.checkbox(
+                "Require identity verification",
+                value=st.session_state.eg_require_verification and admin_allows_verification,
+                disabled=not admin_allows_verification,
+                help=(
+                    "Students must show an ID card and a live selfie before submitting."
+                    if admin_allows_verification else
+                    "Disabled by your administrator — identity verification cannot be "
+                    "required for any exam right now."
+                ),
+            )
+        with proctor_col:
+            st.session_state.eg_enable_proctoring = st.checkbox(
+                "Enable proctoring (screen & camera recording)",
+                value=st.session_state.eg_enable_proctoring and admin_allows_proctoring,
+                disabled=not admin_allows_proctoring,
+                help=(
+                    "Records the student's screen, camera, microphone, tab switches, "
+                    "keystrokes, and mouse activity while they work on this exam."
+                    if admin_allows_proctoring else
+                    "Disabled by your administrator — proctoring cannot be enabled "
+                    "for any exam right now."
+                ),
+            )
+
         setup_col1, setup_col2 = st.columns(2)
         with setup_col1:
             if st.session_state.questions and st.button(
@@ -1432,6 +1501,8 @@ def exam_grading_ui() -> None:
                     sub_rubric=st.session_state.sub_rubric,
                     max_points=int(st.session_state.max_points),
                     access_code=st.session_state.eg_access_code.strip() or None,
+                    require_verification=st.session_state.eg_require_verification,
+                    enable_proctoring=st.session_state.eg_enable_proctoring,
                     set_by=int(st.session_state["user"]["id"]),
                 )
                 st.success(

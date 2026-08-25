@@ -128,7 +128,15 @@ from src.features.proctoring.proctoring_feature import (
     start_proctor_analysis_scheduler,
     get_proctor_video_quality,
     set_proctor_video_quality,
+    get_record_webcam_video,
+    set_record_webcam_video,
+    get_proctoring_admin_lock,
+    set_proctoring_admin_lock,
     VIDEO_QUALITY_PRESETS,
+)
+from src.features.exam_verification.exam_verification_feature import (
+    get_verification_admin_settings,
+    set_verification_admin_settings,
 )
 
 # llm_utils.MODELS is referenced by the profile page to build per-feature model
@@ -2304,6 +2312,22 @@ def _admin_maintenance_tab():
          this app has no background worker/cron of its own otherwise, so
          nothing purges data unless an admin clicks the button (or an
          external scheduler calls the same function directly).
+      4. Identity Verification Photo Storage: whether the ID-card photo and/
+         or selfie captured during identity verification are written to
+         disk — see get_verification_admin_settings()/
+         set_verification_admin_settings() in exam_verification_feature.py.
+         OCR/face-match checks always run regardless of these toggles.
+      5. Webcam Recording: whether proctoring captures the webcam camera
+         stream at all (video, periodic frames, face/gaze analysis), or
+         screen-only — see get_record_webcam_video()/
+         set_record_webcam_video() in proctoring_feature.py.
+      6. Instructor Permissions: global locks on whether instructors are
+         allowed to require identity verification / enable proctoring for
+         their own exams, quizzes, and oral exams at all. When locked, the
+         effective value is forced off at runtime regardless of what any
+         individual exam/quiz/oral-exam has stored — see
+         effective_require_verification() in exam_verification_feature.py
+         and effective_enable_proctoring() in proctoring_feature.py.
     """
     st.subheader("Email (SMTP) Settings")
     st.write(
@@ -2370,6 +2394,83 @@ def _admin_maintenance_tab():
     if st.button("Save Video Recording Quality", type="primary"):
         set_proctor_video_quality(selected_quality)
         st.success(f"Video recording quality set to {quality_labels.get(selected_quality, selected_quality)}.")
+
+    st.divider()
+
+    st.subheader("Identity Verification Photo Storage")
+    st.write(
+        "Whether the ID-card photo and selfie a student captures during "
+        "identity verification are saved to disk. OCR text reading and "
+        "face-match comparison always run regardless of these settings — "
+        "only whether the actual image is kept afterward is affected."
+    )
+    verification_settings = get_verification_admin_settings()
+    save_id_card = st.checkbox(
+        "Save ID card photo", value=verification_settings["save_id_card_photo"], key="admin_save_id_card_photo"
+    )
+    save_selfie = st.checkbox(
+        "Save selfie photo", value=verification_settings["save_selfie_photo"], key="admin_save_selfie_photo"
+    )
+    if st.button("Save Photo Storage Settings", type="primary"):
+        set_verification_admin_settings(
+            save_id_card_photo=save_id_card,
+            save_selfie_photo=save_selfie,
+            allow_instructor_verification_toggle=verification_settings["allow_instructor_verification_toggle"],
+        )
+        st.success("Photo storage settings saved.")
+        st.rerun()
+
+    st.divider()
+
+    st.subheader("Webcam Recording")
+    st.write(
+        "Whether proctoring captures the student's webcam at all — "
+        "continuous video, periodic frame snapshots, and face/gaze "
+        "analysis — in addition to screen recording. When turned off, "
+        "students are never asked for camera permission and only screen "
+        "recording plus tab-switch/keystroke/mouse monitoring run. "
+        "Microphone recording is unaffected by this setting."
+    )
+    record_webcam = st.checkbox(
+        "Include webcam video in proctoring recordings",
+        value=get_record_webcam_video(),
+        key="admin_record_webcam_video",
+    )
+    if st.button("Save Webcam Recording Setting", type="primary"):
+        set_record_webcam_video(record_webcam)
+        st.success("Webcam recording setting saved.")
+        st.rerun()
+
+    st.divider()
+
+    st.subheader("Instructor Permissions")
+    st.write(
+        "Whether instructors are allowed to require identity verification / "
+        "enable proctoring at all for their own exams, quizzes, and oral "
+        "exams. When you turn one of these off here, it takes effect "
+        "immediately for every assessment — instructors can no longer turn "
+        "it on, and any assessment that already had it on stops enforcing "
+        "it until you turn this back on."
+    )
+    allow_verification_toggle = st.checkbox(
+        "Allow instructors to require identity verification",
+        value=verification_settings["allow_instructor_verification_toggle"],
+        key="admin_allow_instructor_verification_toggle",
+    )
+    allow_proctoring_toggle = st.checkbox(
+        "Allow instructors to enable proctoring",
+        value=get_proctoring_admin_lock(),
+        key="admin_allow_instructor_proctoring_toggle",
+    )
+    if st.button("Save Instructor Permissions", type="primary"):
+        set_verification_admin_settings(
+            save_id_card_photo=verification_settings["save_id_card_photo"],
+            save_selfie_photo=verification_settings["save_selfie_photo"],
+            allow_instructor_verification_toggle=allow_verification_toggle,
+        )
+        set_proctoring_admin_lock(allow_proctoring_toggle)
+        st.success("Instructor permissions saved.")
+        st.rerun()
 
     st.divider()
 

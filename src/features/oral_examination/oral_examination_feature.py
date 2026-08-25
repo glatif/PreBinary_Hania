@@ -51,7 +51,11 @@ from db import get_connection
 from auth import save_uploaded_file
 
 from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, generate_llm_response, strip_llm_json, transcribe_audio
-from src.features.exam_verification.exam_verification_feature import verify_student_identity
+from src.features.exam_verification.exam_verification_feature import (
+    verify_student_identity,
+    get_verification_admin_settings,
+    effective_require_verification,
+)
 from src.utils.access_gate import verify_access_code
 from src.features.exam_grading.exam_grading_feature import create_grading_prompt
 from src.features.quiz_generator.document_processor import (
@@ -62,6 +66,8 @@ from src.features.quiz_generator.document_processor import (
 from src.utils.attempt_log import log_attempt_event, get_incomplete_attempts
 from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
+    get_proctoring_admin_lock,
+    effective_enable_proctoring,
     get_proctor_summary_by_user_assessment,
     get_proctor_frames_by_user_assessment,
     get_proctor_webcam_summary_by_user_assessment,
@@ -158,6 +164,8 @@ def save_oral_exam_setup(
     max_points_per_question: int,
     set_by: int,
     access_code: str = None,
+    require_verification: bool = True,
+    enable_proctoring: bool = True,
 ) -> None:
     """
     Persist the canonical oral exam setup for an assessment. One row per
@@ -166,22 +174,35 @@ def save_oral_exam_setup(
 
     access_code is optional — None/blank means students need no code to
     start, matching the previous (pre-access-code) behavior.
+
+    require_verification/enable_proctoring are the instructor's per-exam
+    toggles for identity verification / proctoring, both defaulting to
+    enabled. The effective value honored at exam-start time also factors in
+    the admin-level lock — see effective_require_verification()/
+    effective_enable_proctoring().
     """
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             """
-            INSERT INTO oral_exam_setups (assessment_id, questions, rubric, max_points_per_question, access_code, set_by)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO oral_exam_setups
+                (assessment_id, questions, rubric, max_points_per_question, access_code,
+                 require_verification, enable_proctoring, set_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
-                questions = VALUES(questions),
-                rubric = VALUES(rubric),
-                max_points_per_question = VALUES(max_points_per_question),
-                access_code = VALUES(access_code),
-                set_by = VALUES(set_by)
+                questions                = VALUES(questions),
+                rubric                   = VALUES(rubric),
+                max_points_per_question  = VALUES(max_points_per_question),
+                access_code              = VALUES(access_code),
+                require_verification     = VALUES(require_verification),
+                enable_proctoring        = VALUES(enable_proctoring),
+                set_by                   = VALUES(set_by)
             """,
-            (assessment_id, questions, rubric, max_points_per_question, access_code or None, set_by),
+            (
+                assessment_id, questions, rubric, max_points_per_question, access_code or None,
+                int(require_verification), int(enable_proctoring), set_by,
+            ),
         )
         conn.commit()
     finally:
@@ -195,7 +216,8 @@ def get_oral_exam_setup(assessment_id: int) -> Dict:
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(
-            "SELECT questions, rubric, max_points_per_question, access_code, updated_at "
+            "SELECT questions, rubric, max_points_per_question, access_code, "
+            "require_verification, enable_proctoring, updated_at "
             "FROM oral_exam_setups WHERE assessment_id = %s",
             (assessment_id,),
         )
@@ -860,7 +882,8 @@ def _render_student_oral_exam(
     if not verify_access_code(setup.get("access_code"), gate_key=oral_gate_key):
         return
 
-    if not verify_student_identity(user, gate_key=oral_gate_key):
+    verification_required = effective_require_verification(setup.get("require_verification", True))
+    if verification_required and not verify_student_identity(user, gate_key=oral_gate_key):
         return
 
     session_key = f"oral_exam_session_id_{assessment_id}"
@@ -868,14 +891,19 @@ def _render_student_oral_exam(
         st.session_state[session_key] = str(uuid.uuid4())
     session_id = st.session_state[session_key]
 
-    render_proctor_monitor(
-        gate_key=f"oral_exam_{assessment_id}",
-        user=user,
-        quiz_id=None,
-        assessment_id=assessment_id,
-    )
+    proctoring_enabled = effective_enable_proctoring(setup.get("enable_proctoring", True))
+    if proctoring_enabled:
+        render_proctor_monitor(
+            gate_key=f"oral_exam_{assessment_id}",
+            user=user,
+            quiz_id=None,
+            assessment_id=assessment_id,
+        )
 
-    st.success("Identity verified. Proctoring is active for the remainder of this exam.")
+    if verification_required:
+        st.success("Identity verified. Proctoring is active for the remainder of this exam.")
+    else:
+        st.success("You may now begin the oral exam.")
 
     # Logged once per browser session — guarded the same way session_key
     # above is, so a page rerun doesn't write a new 'started' row every time
@@ -1133,6 +1161,8 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
     rubric_key = f"oral_setup_rubric_{assessment_id}"
     points_key = f"oral_setup_points_{assessment_id}"
     access_code_key = f"oral_setup_access_code_{assessment_id}"
+    require_verification_key = f"oral_setup_require_verification_{assessment_id}"
+    enable_proctoring_key = f"oral_setup_enable_proctoring_{assessment_id}"
 
     if questions_key not in st.session_state:
         existing_setup = get_oral_exam_setup(assessment_id)
@@ -1144,13 +1174,25 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
             st.session_state[rubric_key] = existing_setup.get("rubric") or ""
             st.session_state[points_key] = existing_setup.get("max_points_per_question") or 10
             st.session_state[access_code_key] = existing_setup.get("access_code") or ""
+            st.session_state[require_verification_key] = (
+                bool(existing_setup["require_verification"])
+                if existing_setup.get("require_verification") is not None else True
+            )
+            st.session_state[enable_proctoring_key] = (
+                bool(existing_setup["enable_proctoring"])
+                if existing_setup.get("enable_proctoring") is not None else True
+            )
         else:
             st.session_state[questions_key] = []
             st.session_state[rubric_key] = ""
             st.session_state[points_key] = 10
             st.session_state[access_code_key] = ""
+            st.session_state[require_verification_key] = True
+            st.session_state[enable_proctoring_key] = True
     st.session_state.setdefault(content_key, "")
     st.session_state.setdefault(access_code_key, "")
+    st.session_state.setdefault(require_verification_key, True)
+    st.session_state.setdefault(enable_proctoring_key, True)
 
     source_mode = st.radio(
         "Source material for question generation",
@@ -1324,6 +1366,39 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
         help="If set, students must enter this code before they can start. Leave blank to require no code.",
     )
 
+    admin_settings = get_verification_admin_settings()
+    admin_allows_verification = admin_settings["allow_instructor_verification_toggle"]
+    admin_allows_proctoring = get_proctoring_admin_lock()
+
+    verify_col, proctor_col = st.columns(2)
+    with verify_col:
+        st.session_state[require_verification_key] = st.checkbox(
+            "Require identity verification",
+            value=st.session_state[require_verification_key] and admin_allows_verification,
+            key=f"{require_verification_key}_widget",
+            disabled=not admin_allows_verification,
+            help=(
+                "Students must show an ID card and a live selfie before starting."
+                if admin_allows_verification else
+                "Disabled by your administrator — identity verification cannot be "
+                "required for any oral exam right now."
+            ),
+        )
+    with proctor_col:
+        st.session_state[enable_proctoring_key] = st.checkbox(
+            "Enable proctoring (screen & camera recording)",
+            value=st.session_state[enable_proctoring_key] and admin_allows_proctoring,
+            key=f"{enable_proctoring_key}_widget",
+            disabled=not admin_allows_proctoring,
+            help=(
+                "Records the student's screen, camera, microphone, tab switches, "
+                "keystrokes, and mouse activity while they answer this oral exam."
+                if admin_allows_proctoring else
+                "Disabled by your administrator — proctoring cannot be enabled for "
+                "any oral exam right now."
+            ),
+        )
+
     # Students identify "their next question" by matching question_number
     # against the live setup (see _render_student_oral_exam), so editing and
     # re-saving the question list after someone has already started answering
@@ -1355,6 +1430,8 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
             rubric=st.session_state[rubric_key],
             max_points_per_question=int(st.session_state[points_key]),
             access_code=st.session_state[access_code_key].strip() or None,
+            require_verification=st.session_state[require_verification_key],
+            enable_proctoring=st.session_state[enable_proctoring_key],
             set_by=set_by,
         )
         total_possible = len(st.session_state[questions_key]) * int(st.session_state[points_key])

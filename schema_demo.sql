@@ -525,6 +525,15 @@ CREATE TABLE exam_setups (
     -- Optional code a student must enter before submitting this exam. NULL/blank
     -- means no code is required (fully backward compatible with existing setups).
     access_code   VARCHAR(50) NULL,
+    -- Per-exam instructor toggles for identity verification / proctoring,
+    -- both defaulting to enabled (matches pre-existing always-on behavior).
+    -- The effective value at runtime is this flag AND the admin-level
+    -- allow_instructor_verification_toggle/allow_instructor_proctoring_toggle
+    -- in app_settings — an admin lock forces the effective value to 0
+    -- regardless of what's stored here. See save_exam_setup()/get_exam_setup()
+    -- in exam_grading_feature.py.
+    require_verification TINYINT(1) NOT NULL DEFAULT 1,
+    enable_proctoring     TINYINT(1) NOT NULL DEFAULT 1,
     set_by        INT  NOT NULL,
     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
@@ -998,9 +1007,17 @@ CREATE TABLE quiz_proctor_video_segments (
 -- whose screen/webcam recording starts after the change.
 
 CREATE TABLE proctor_settings (
-    id            INT PRIMARY KEY DEFAULT 1,
-    video_quality ENUM('low', 'medium', 'high') NOT NULL DEFAULT 'medium',
-    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    id                  INT PRIMARY KEY DEFAULT 1,
+    video_quality       ENUM('low', 'medium', 'high') NOT NULL DEFAULT 'medium',
+    -- Whether the webcam camera stream (continuous video recording, periodic
+    -- frame snapshots, and face/gaze analysis) is used at all during a
+    -- proctored session. When 0, only screen recording plus tab/keystroke/
+    -- mouse monitoring run — the browser is never asked for camera
+    -- permission. Microphone recording is independent of this flag. See
+    -- get_record_webcam_video()/set_record_webcam_video() in
+    -- proctoring_feature.py.
+    record_webcam_video TINYINT(1) NOT NULL DEFAULT 1,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 INSERT INTO proctor_settings (id, video_quality) VALUES (1, 'medium');
@@ -1021,6 +1038,23 @@ CREATE TABLE app_settings (
     id                INT PRIMARY KEY DEFAULT 1,
     smtp_sender_email VARCHAR(255) NULL,
     smtp_app_password VARCHAR(255) NULL,
+    -- Whether the ID-card photo / selfie captured during identity
+    -- verification (exam_verification_feature.py) are written to disk and
+    -- have their path recorded on the verification_attempts row. OCR and
+    -- face-match checks always run in-memory regardless of these flags —
+    -- only persistence of the actual image is toggled. See
+    -- get_verification_admin_settings()/set_verification_admin_settings()
+    -- in exam_verification_feature.py.
+    save_id_card_photo TINYINT(1) NOT NULL DEFAULT 1,
+    save_selfie_photo  TINYINT(1) NOT NULL DEFAULT 1,
+    -- Global permission gates: whether instructors are allowed to require
+    -- identity verification / enable proctoring at all for their own exams,
+    -- quizzes, and oral exams. When 0, the effective value at runtime is
+    -- forced to "off" regardless of what any exam_setups/oral_exam_setups/
+    -- quiz_generator_settings row has stored, and the instructor-facing
+    -- checkboxes are disabled in the UI.
+    allow_instructor_verification_toggle TINYINT(1) NOT NULL DEFAULT 1,
+    allow_instructor_proctoring_toggle   TINYINT(1) NOT NULL DEFAULT 1,
     updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -1101,6 +1135,10 @@ CREATE TABLE oral_exam_setups (
     -- Optional code a student must enter before starting this oral exam.
     -- NULL/blank means no code is required (backward compatible).
     access_code             VARCHAR(50) NULL,
+    -- Per-exam instructor toggles for identity verification / proctoring —
+    -- see the matching columns on exam_setups above for the full semantics.
+    require_verification    TINYINT(1) NOT NULL DEFAULT 1,
+    enable_proctoring       TINYINT(1) NOT NULL DEFAULT 1,
     set_by                  INT NOT NULL,
     updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
@@ -1225,6 +1263,32 @@ CREATE TABLE plagiarism_results (
     FOREIGN KEY (student_b_id)  REFERENCES users(id)       ON DELETE CASCADE,
     UNIQUE KEY uq_plagiarism_pair (assessment_id, feature_name, student_a_id, student_b_id),
     INDEX idx_plagiarism_assessment (assessment_id, feature_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 31. QUIZ GENERATOR SETTINGS
+-- =============================================================================
+-- One row per assessment: the instructor's identity-verification/proctoring
+-- toggles for the Practice Quiz feature (quiz_generator_feature.py). Unlike
+-- Exam Grading and Oral Exam, practice quizzes have no other instructor
+-- "setup" step to attach these to — a row here is upserted from the
+-- instructor-only "Quiz Settings" panel in render_instructor_attempts_tab().
+-- Missing row (no instructor has ever saved settings for this assessment)
+-- means both toggles default to enabled, matching the always-on behavior
+-- from before this table existed. See save_quiz_generator_settings()/
+-- get_quiz_generator_settings() in quiz_generator_feature.py.
+
+CREATE TABLE quiz_generator_settings (
+    id                    INT AUTO_INCREMENT PRIMARY KEY,
+    assessment_id         INT NOT NULL UNIQUE,
+    require_verification  TINYINT(1) NOT NULL DEFAULT 1,
+    enable_proctoring     TINYINT(1) NOT NULL DEFAULT 1,
+    set_by                INT NOT NULL,
+    updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+    FOREIGN KEY (set_by)        REFERENCES users(id)       ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

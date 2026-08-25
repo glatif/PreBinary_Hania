@@ -263,6 +263,91 @@ def check_face_match(id_card_image: Image.Image, selfie_image: Image.Image) -> d
 
 
 # =============================================================================
+# ADMIN SETTINGS — photo storage toggles and instructor permission locks
+# =============================================================================
+# Single-row app_settings table (shared with auth.py's SMTP config — see
+# get_smtp_config()/set_smtp_config()). save_id_card_photo/save_selfie_photo
+# control whether verify_student_identity() persists the captured images to
+# disk at all; OCR and face-match always run in-memory regardless.
+# allow_instructor_verification_toggle is the admin-level lock referenced by
+# exam_grading_feature.py, oral_examination_feature.py, and
+# quiz_generator_feature.py when deciding whether to honor a per-exam
+# require_verification flag.
+
+def get_verification_admin_settings() -> dict:
+    """
+    Return the admin-configured verification settings:
+    {"save_id_card_photo": bool, "save_selfie_photo": bool,
+     "allow_instructor_verification_toggle": bool}.
+
+    Falls back to all-True (today's behavior — always save both photos,
+    instructors always allowed to require verification) if the row is
+    missing, e.g. the migration hasn't been applied yet.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT save_id_card_photo, save_selfie_photo, "
+            "allow_instructor_verification_toggle FROM app_settings WHERE id = 1"
+        )
+        row = cursor.fetchone()
+    except Exception:
+        row = None
+    finally:
+        cursor.close()
+        conn.close()
+
+    if not row:
+        return {
+            "save_id_card_photo": True,
+            "save_selfie_photo": True,
+            "allow_instructor_verification_toggle": True,
+        }
+    return {
+        "save_id_card_photo": bool(row["save_id_card_photo"]),
+        "save_selfie_photo": bool(row["save_selfie_photo"]),
+        "allow_instructor_verification_toggle": bool(row["allow_instructor_verification_toggle"]),
+    }
+
+
+def set_verification_admin_settings(
+    save_id_card_photo: bool, save_selfie_photo: bool, allow_instructor_verification_toggle: bool
+) -> None:
+    """Persist admin-configured verification photo-storage/permission settings."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO app_settings (id, save_id_card_photo, save_selfie_photo, allow_instructor_verification_toggle)
+            VALUES (1, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                save_id_card_photo = VALUES(save_id_card_photo),
+                save_selfie_photo  = VALUES(save_selfie_photo),
+                allow_instructor_verification_toggle = VALUES(allow_instructor_verification_toggle)
+            """,
+            (int(save_id_card_photo), int(save_selfie_photo), int(allow_instructor_verification_toggle)),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def effective_require_verification(per_exam_require_verification: bool) -> bool:
+    """
+    Resolve whether identity verification should actually be enforced,
+    combining the instructor's per-exam choice with the admin-level
+    permission lock. An admin lock always wins — see
+    allow_instructor_verification_toggle above.
+    """
+    return bool(per_exam_require_verification) and get_verification_admin_settings()[
+        "allow_instructor_verification_toggle"
+    ]
+
+
+# =============================================================================
 # PHOTO STORAGE — keep the actual ID-card/selfie captures, not just the OCR/
 # face-match metadata derived from them
 # =============================================================================
@@ -392,8 +477,18 @@ def verify_student_identity(student: dict, gate_key: str) -> bool:
     id_card_image = Image.open(id_card_shot)
     selfie_image  = Image.open(selfie_shot)
 
-    id_card_image_path = _save_verification_photo(id_card_image, student.get("id"), gate_key, "id_card")
-    selfie_image_path  = _save_verification_photo(selfie_image, student.get("id"), gate_key, "selfie")
+    # OCR and face-match below always run against the in-memory images
+    # regardless of these settings — only whether the JPEG gets written to
+    # disk and its path recorded on the verification_attempts row is toggled.
+    photo_settings = get_verification_admin_settings()
+    id_card_image_path = (
+        _save_verification_photo(id_card_image, student.get("id"), gate_key, "id_card")
+        if photo_settings["save_id_card_photo"] else None
+    )
+    selfie_image_path = (
+        _save_verification_photo(selfie_image, student.get("id"), gate_key, "selfie")
+        if photo_settings["save_selfie_photo"] else None
+    )
 
     with st.spinner("Reading ID document..."):
         ocr_text      = _extract_id_card_text(id_card_image)
