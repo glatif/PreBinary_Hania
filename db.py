@@ -18,18 +18,19 @@
 import mysql.connector
 from sqlalchemy import create_engine
 
+import os
 
 # =============================================================================
 # CONNECTION CONFIGURATION
 # =============================================================================
 
-DB_CONFIG = {
-    "host":     "localhost",
-    "user":     "streamlit_user",
-    "password": "streamlit_pass",
-    "database": "streamlit_database",
-}
 
+DB_CONFIG = {
+    "host":     os.environ.get("DB_HOST", "localhost"),
+    "user":     os.environ.get("DB_USER", "streamlit_user"),
+    "password": os.environ.get("DB_PASSWORD", "streamlit_pass"),
+    "database": os.environ.get("DB_NAME", "streamlit_database"),
+}
 
 # =============================================================================
 # CONNECTION FACTORIES
