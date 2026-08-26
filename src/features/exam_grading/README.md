@@ -2,18 +2,22 @@
 
 ## Overview
 
-The Exam Grading System automates the grading of student exam submissions using local LLMs. Professors can define questions, rubrics, and sub-rubrics, then upload student PDF submissions. The system will analyze and grade each submission according to the defined criteria. All grading sessions are persisted to the database and accessible across logins.
+The Exam Grading System automates the grading of student exam submissions using local or cloud LLMs. Professors can define questions, rubrics, and sub-rubrics, then upload student submissions in PDF, Word, PowerPoint, text, or ZIP format. The system will analyze and grade each submission according to the defined criteria. All grading sessions are persisted to the database and accessible across logins.
 
 ## Features
 
 - Define exam questions and detailed grading rubrics
 - Set maximum points for the exam
-- Upload individual student PDF submissions or a ZIP file containing multiple submissions
-- Automated grading of submissions using local LLMs
-- Detailed feedback for each student
+- Upload individual student submissions (PDF, DOC/DOCX, PPT/PPTX, TXT) or a ZIP file containing multiple submissions — including submissions nested in subfolders within the ZIP
+- Automated grading of submissions using local or cloud LLMs
+- Detailed feedback for each student, plus a per-question score breakdown table
 - Export results to CSV for record-keeping
 - Grading history stored in the database, grouped by session per assessment
 - Load previous session setup (questions and rubric) directly into the Setup Exam tab for reuse
+- **Optional access code**: instructors can require students to enter a code before they can start uploading a submission
+- **Identity verification**: instructors can require students to pass photo ID verification before submitting (on by default; can be disabled per exam, subject to an admin-level lock — see the [main README](../../../README.md#features))
+- **Proctoring**: instructors can enable tab-switch/screen-share/keystroke/mouse monitoring plus webcam and mic recording while a student is submitting (on by default; can be disabled per exam, subject to an admin-level lock)
+- **Plagiarism scan**: admins can run an on-demand similarity check across all student submissions on an assessment from Admin Panel → Maintenance → "Run Plagiarism Scan"
 
 ## Usage Instructions
 
@@ -25,6 +29,8 @@ The Exam Grading System automates the grading of student exam submissions using 
 4. Define the grading rubric, including specific point allocations
 5. (Optional) Add sub-rubrics with more detailed grading guidelines
 6. Set the maximum points for the exam
+7. (Optional) Set an access code students must enter before submitting
+8. (Optional) Toggle whether students must pass identity verification and/or be proctored while submitting (both default on, subject to any admin-level lock)
 
 Example setup:
 ```
@@ -59,14 +65,15 @@ Rubric:
 
 ### Step 2: Upload Student Submissions
 
-1. Go to the "Student Submissions" section
-2. You can either:
-   - Upload individual PDF files (one per student)
-   - Upload a ZIP file containing multiple PDF submissions
-3. The system will process the submissions and extract the text content
+1. If an access code is set, the student enters it first; if identity verification is required, the student then completes photo ID verification before the upload form appears
+2. Go to the "Student Submissions" section
+3. You can either:
+   - Upload individual files (PDF, DOC/DOCX, PPT/PPTX, or TXT — one per student)
+   - Upload a ZIP file containing multiple submissions (subfolders inside the ZIP are supported)
+4. The system will process the submissions and extract the text content
 
 Naming convention for files:
-- Individual files: `StudentName_StudentID.pdf` (the system will extract name and ID if available)
+- Individual files: `StudentName_StudentID.pdf` (or `.docx`/`.pptx`/`.txt` — the system will extract name and ID if available)
 - Files in ZIP: Same naming convention as above
 You can test the system using a sample ZIP folder containing student submissions. Click [here](../src/features/exam_grading/zipfolder/testing.zip) to download the sample ZIP folder.
 
@@ -82,6 +89,7 @@ You can test the system using a sample ZIP folder containing student submissions
    - Percentage
    - Feedback
    - Detailed explanation of the grading
+   - Per-question breakdown table showing the score awarded for each question
 5. Export the results to CSV by clicking "Download Results as CSV"
 
 ### Step 4: View and Reuse Grading History
@@ -151,12 +159,14 @@ You can use these to test the system before using it with real exam data.
 
 ## Technical Details
 
-- Text extraction from PDFs using PyPDF
+- Text extraction from PDF (PyPDF), Word (`.docx`), PowerPoint (`.pptx`/`.ppt`), and plain text (`.txt`) submissions, including files nested in ZIP subfolders
 - LLM options: All models supported by the application — DeepSeek R1:1.5B and Llama 3.2 (local, via Ollama), Llama 3.3-70B (Groq), Gemini 2.5 Flash (Google), GPT-4o (OpenAI), GPT-4o (GitHub Models)
 - Prompt engineering to ensure consistent grading
-- Structured JSON response parsing for consistent score formats
+- Structured JSON response parsing for consistent score formats, including a per-question breakdown
 - Grading results stored in the `exam_grading_results` table, grouped by `grading_session_id`
-- Each row stores the full exam setup (questions, rubric, sub-rubric, max points) alongside the student result, so any session can be fully restored from history alone
+- Each row stores the full exam setup (questions, rubric, sub-rubric, max points, access code, verification/proctoring requirements) alongside the student result, so any session can be fully restored from history alone
+- Access code, identity verification, and proctoring requirements are stored per-assessment in `exam_setups` and enforced via `verify_access_code()`, `verify_student_identity()`/`effective_require_verification()`, and `effective_enable_proctoring()` before the upload form is shown
+- Plagiarism similarity scores for this feature's submissions are stored in the `plagiarism_results` table, computed via local sentence embeddings (see [main README](../../../README.md#database-structure))
 
 ## Best Practices
 

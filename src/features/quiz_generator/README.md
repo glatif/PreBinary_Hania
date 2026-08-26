@@ -53,6 +53,10 @@ The Practice for Exam/Quiz feature (formerly Quiz Generator) allows students to 
 - **My History tab**: Each student can review all their own attempts, including scores, source files used, and a full question-by-question breakdown. Individual attempts can be downloaded or deleted.
 - **Student Attempts tab** (instructor and admin only): Displays all student attempts across the assessment in a single view, with the same per-attempt detail and download options available for each entry
 
+### 8. Identity Verification & Proctoring
+- From the "⚙️ Quiz Settings" expander on the Student Attempts tab, instructors can require students to pass photo ID verification before starting a quiz, and/or enable proctoring (tab-switch/screen-share/keystroke/mouse monitoring plus webcam and mic recording) while the quiz is in progress
+- Both are on by default per assessment and can be turned off by the instructor, subject to an admin-level lock (see the [main README](../../../README.md#features))
+
 ## How to Use
 
 ### Step 1: Data Input & Analysis
@@ -133,6 +137,7 @@ The Practice for Exam/Quiz feature (formerly Quiz Generator) allows students to 
 - Generated quizzes are stored in the `practice_quiz_generated` table, linked to the current assessment and user
 - Student attempts are stored in the `practice_quiz_attempts` table, linked to the quiz and assessment
 - Uploaded source files are stored in the `files` table with `feature_name = 'practice_quiz'`, saved to `uploads/{course_id}_{course_name}/practice_quiz/{assessment_title}/` on disk
+- Per-assessment identity verification and proctoring requirements are stored in the `quiz_generator_settings` table and enforced via `verify_student_identity()`/`effective_require_verification()` and `effective_enable_proctoring()` before a student can start the quiz
 
 ### Supported AI Models
 - **Local Models** (via Ollama):

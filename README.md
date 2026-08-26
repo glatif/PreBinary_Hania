@@ -41,6 +41,12 @@ AI_Instructor/
 - **Student Verification (Quiz Submission)** *(in progress)*: Verifies students via student card before/during quiz submission; not fully wired up yet
 - **Proctoring**: Tab-switch and screen-share monitoring, eye movement tracking, plus keystroke logging (sent every ~15s), mic audio recording (10s clips, kept only if speech is detected), and screen+webcam video recording (30s segments, admin-configurable quality, ~2hr cap). Instructors can stitch segments into full recordings (screen, webcam+audio, or combined picture-in-picture). Heavy analysis runs in the background every 15 minutes or on-demand via Admin Panel → Maintenance. Teachers/admins can delete a student's monitoring data per attempt/assessment, in addition to the existing bulk age-based cleanup
 - **Attempt Logging**: Tracks the full lifecycle of quiz/oral exam attempts (started, question reached, submitted, timed out, skipped, completed), so teachers can see who started but didn't finish
+- **Email & Password Reset (SMTP)**: Admin-configurable Gmail SMTP settings send temp-password emails on roster import/admin resets, plus a self-service "Forgot password?" flow for users
+- **Roster Import**: Instructors upload a CSV/XLSX class list (First Name, Last Name, ID Number, Email); matching students are enrolled and new ones get accounts created, with validation, conflict detection, credential resend, and a per-row Include checkbox to exclude rows before committing
+- **Gradebook**: Per-course CSV export combining every quiz/exam/oral exam grade into one row per student, aggregated across all assessment types
+- **Plagiarism Scan**: On-demand similarity check across student submissions on the same assessment using local sentence embeddings, with an LLM-generated explanation for pairs above the similarity threshold
+- **Access Codes**: Instructors can require an optional access code before a student can start a quiz or exam
+- **Admin Privacy & Permission Controls**: Admins can toggle whether ID-card/selfie photos from identity verification are persisted to disk (OCR/face-match still runs either way), whether proctoring captures webcam video at all (vs. screen-only), and can globally lock instructors out of enabling verification/proctoring for their own assessments
 
 ## LLM Support
 
@@ -185,6 +191,8 @@ If you have an **existing database** you want to keep data in, run the relevant 
 
 - `migration_add_proctor_analysis_status.sql` must run **after** `migration_add_audio_proctoring.sql` and `migration_add_video_proctoring.sql`, since it alters their tables
 - `migration_add_proctor_video_quality_setting.sql` can run at any time
+- `migration_add_course_platform_v2.sql` can run at any time (SMTP settings, roster import support, gradebook, plagiarism results, access codes)
+- `migration_add_verification_proctoring_settings.sql` can run at any time (verification photo storage toggles, webcam recording toggle, instructor permission locks)
 
 ### 4. Set Up Python Environment
 
@@ -291,7 +299,9 @@ The application uses a MySQL database (`streamlit_database`) with the following 
 - **quiz_proctor_webcam_frames** — captured webcam frames for proctoring analysis
 - **quiz_proctor_audio_clips** — recorded mic audio clips (10s, kept only if speech is detected)
 - **quiz_proctor_video_segments** — recorded screen+webcam video segments (30s, admin-configurable quality tier, ~2hr cap)
-
+- **app_settings** — single-row table for SMTP sender credentials, identity-verification photo storage toggles, and instructor permission locks (verification/proctoring)
+- **proctor_settings** — single-row table for admin-configurable proctoring video quality tier and webcam recording toggle
+- **plagiarism_results** — pairwise similarity scores and LLM-generated overlap explanations between student submissions on the same assessment, keyed by assessment/feature/student pair
 
 All feature history tables cascade-delete when the parent assessment is deleted, ensuring no orphaned records are left behind.
 
@@ -430,6 +440,20 @@ For detailed information about each feature, refer to the specific documentation
 
 ## Recent Updates by Hania
 
+### Admin Controls — Verification Photo Storage, Webcam Recording, Instructor Locks
+- Admins can toggle whether the ID-card photo and/or selfie captured during identity verification are saved to disk — OCR text reading and face-match comparison always run regardless, only whether the image itself is kept afterward is affected
+- Admins can toggle whether proctoring captures webcam video at all (continuous video, periodic frames, face/gaze analysis) versus screen-only; when off, students are never asked for camera permission, and mic recording is unaffected
+- Admins can globally lock instructors out of requiring identity verification or enabling proctoring for their own exams, quizzes, and oral exams — when locked, the effective setting is forced off at runtime regardless of what any individual assessment has stored
+- All three controls live in Admin Panel → Maintenance
+
+### Email / Password Reset, Roster Import, Gradebook, Plagiarism Scan, Access Codes
+- Admin-configurable Gmail SMTP settings (Admin Panel → Maintenance) power temp-password emails on roster import/admin resets, plus a self-service "Forgot password?" flow on the login page
+- Roster import: instructors upload a CSV/XLSX class list (First Name, Last Name, ID Number, Email); existing accounts are enrolled and new ones are created in one pass, with column-alias detection, validation/preview before commit, ID-number conflict detection, and credential resend. The preview table has a per-row "Include" checkbox so individual rows can be excluded before committing, plus a separate checkbox to opt into updating name/ID number on existing accounts that differ from the file (off by default — matching accounts are enrolled without overwriting their data)
+- Gradebook: per-course CSV export with one row per enrolled student and one column per assessment, aggregating Practice Quiz, Exam Grading, and Oral Examination scores into a single download
+- Plagiarism scan: on-demand pairwise similarity check across student submissions on the same assessment using the app's local sentence-embedding model (no paid API needed), with an LLM-generated explanation for pairs above the similarity threshold — run from Admin Panel → Maintenance → "Run Plagiarism Scan"
+- Access codes: instructors can require an optional access code before a student can start a quiz or exam
+- Exam grading results now include a per-question breakdown table
+
 ### Exam Grading
 - Now accepts PDF, Word, PowerPoint, text, and ZIP (with subfolders) for both question papers and student submissions, not just PDF
 
@@ -492,18 +516,21 @@ For detailed information about each feature, refer to the specific documentation
 - Add a Groq or OpenAI key under **Profile → AI API Keys** for any account taking an oral exam
 - If using the local model for oral exam questions, make sure Ollama is running with `deepseek-r1:1.5b` pulled
 - `pip install -r requirements.txt` picks up new packages automatically (no manual downloads needed)
+- To send temp-password/forgot-password emails, configure a sending Gmail address and app password under **Admin Panel → Maintenance → Email (SMTP) Settings**. Roster import, password reset, and the login page's "Forgot password?" flow all fail gracefully with a clear error until this is set
 
 ## Deployment (Ubuntu Server, Docker)
 
 For running locally, see [Setup Instructions](#setup-instructions) above. To deploy to a production Ubuntu server using Docker, follow these steps. Full details, troubleshooting, and firewall notes are in `DEPLOYMENT.md`.
 
-**Current server:** IONOS, Ubuntu 24.04.4 LTS, `74.208.142.195`, app served at `http://74.208.142.195:8501`. Access is via SSH (PuTTY) and SFTP (WinSCP). Credentials are kept in the team's password manager / server `.env` file, not in the repo.
+**Current server:** Ubuntu (Docker), `144.217.80.160`, app served at `http://144.217.80.160:8501`. Access is via SSH (PuTTY) and SFTP (WinSCP). Credentials are kept in the team's password manager / server `.env` file, not in the repo.
+
+> **Note:** This replaces the earlier IONOS server (`74.208.142.195`), which is no longer the deployment target.
 
 1. **Install local tools** — [PuTTY](https://www.putty.org/) (SSH client) and [WinSCP](https://winscp.net/) (SFTP client).
-2. **Connect to the server** — open PuTTY, host `74.208.142.195`, port `22`, log in as `root`.
+2. **Connect to the server** — open PuTTY, host `144.217.80.160`, port `22`, log in as `root`.
 3. **Initial server setup (one-time)** — `apt update && apt upgrade -y`, reboot if prompted, then add a swap file (recommended for low-RAM servers running ML dependencies).
 4. **Install Docker** — add Docker's official apt repo and GPG key, then `apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`. If `docker.service` fails with a socket-activation error, run `systemctl enable docker.socket && systemctl start docker.socket && systemctl start docker.service`.
-5. **Configure the firewall** — `ufw allow OpenSSH`, `ufw allow 8501/tcp`, `ufw allow 80/tcp`, `ufw allow 443/tcp`, then `ufw --force enable`. ⚠️ If the app still isn't reachable publicly afterward, check for a **provider-level firewall** (e.g. IONOS Cloud Panel → Firewall Policy) — `ufw` rules alone are not enough.
+5. **Configure the firewall** — `ufw allow OpenSSH`, `ufw allow 8501/tcp`, `ufw allow 80/tcp`, `ufw allow 443/tcp`, then `ufw --force enable`. ⚠️ If the app still isn't reachable publicly afterward, check for a **provider-level firewall** in your hosting control panel — `ufw` rules alone are not enough.
 6. **Upload the application** — via WinSCP (SFTP) to `/opt/app`. Upload all `.py` files, `src/`, `requirements.txt`, `*.sql` schema/migration files, and `data/`. Exclude `venv/`, `__pycache__/`, `.git/`, `archive/`, `results/`, `temp_uploads/`, and `uploads/` (local/generated — the container creates its own).
 7. **Set environment variables** — create `/opt/app/.env` on the server (never committed to GitHub) with `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, and `MYSQL_ROOT_PASSWORD`. Per-user API keys (Groq, Gemini, OpenAI, GitHub, ElevenLabs, Cartesia) are stored in the database via the app's Profile page — no server-side action needed for those.
 8. **Docker files** — `Dockerfile` and `docker-compose.yml` are already committed at the project root and don't need to be recreated. `docker-compose.yml` runs a `db` service (MySQL 8.0, auto-imports `schema_clean.sql` on first run) and an `app` service (the Streamlit app, exposed on port `8501`).
@@ -519,7 +546,7 @@ For running locally, see [Setup Instructions](#setup-instructions) above. To dep
     docker compose logs app --tail=50      # look for "You can now view your Streamlit app"
     curl -I http://localhost:8501          # should return HTTP/1.1 200 OK
     ```
-    Then check public access at `http://74.208.142.195:8501`, and confirm the schema imported correctly with:
+    Then check public access at `http://144.217.80.160:8501`, and confirm the schema imported correctly with:
     ```bash
     docker exec -it app-db-1 mysql -u streamlit_user -p streamlit_database -e "SHOW TABLES;"
     ```
@@ -540,14 +567,15 @@ For running locally, see [Setup Instructions](#setup-instructions) above. To dep
 | Symptom | Likely Cause |
 |---|---|
 | `Cannot connect to Docker daemon` | Docker service not running — see step 4 fix above |
-| App builds but isn't reachable publicly | Provider-level (IONOS) firewall blocking the port — check Cloud Panel, not just `ufw` |
+| App builds but isn't reachable publicly | Provider-level firewall blocking the port — check your hosting control panel, not just `ufw` |
 | `Access denied` connecting to MySQL manually | Check `.env` values match exactly; confirm via `docker exec app-db-1 env \| grep MYSQL` |
 | Container restarts in a loop | Check `docker compose logs app` for the actual Python error |
 | Slow build | Expected — the dependency list (torch/tensorflow/deepface/mediapipe) is large; not a hang |
 
-### Notes for the Next Deployment (High-Spec Server)
+### Notes on Server Migrations
 
-- This process is server-agnostic — repeat steps 1–10 on the new server.
-- If the new server has more RAM, the swap file (step 3) is optional but still a good safety net.
-- Confirm whether the new server's provider also has a separate network-level firewall before assuming `ufw` rules are sufficient.
+- The app moved from the original IONOS server (`74.208.142.195`) to the current server (`144.217.80.160`) — this process is server-agnostic, so a future move just repeats steps 1–10 on the new host.
+- Each server has its own independent MySQL database (via the Docker `db` service) — user accounts, courses, and any password changes made on one server (including local development) do **not** carry over to another. Always confirm which server/database you're testing against before assuming a login or data change applies everywhere.
+- If a new server has more RAM, the swap file (step 3) is optional but still a good safety net.
+- Confirm whether a new server's provider also has a separate network-level firewall before assuming `ufw` rules are sufficient.
 - Consider adding a reverse proxy (Nginx) + SSL/domain at this stage instead of exposing port `8501` directly.
