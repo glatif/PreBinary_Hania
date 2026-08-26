@@ -59,7 +59,7 @@ MODELS = {
     "DeepSeek (Thinking model)": "deepseek-r1:1.5B",
     "Llama 3.2 (by Meta)": "llama3.2",
     "Llama 3.3-70B (via Groq)": "llama-3.3-70b-groq",
-    "Gemini 2.5 Flash (via Google)": "gemini-2.5-flash",
+    "Gemini 3.6 Flash (via Google)": "gemini-3.6-flash",
     "GPT-4o (via OpenAI)": "gpt-4o",
     "GPT-4o (via GitHub Models)": "gpt-4o-github",
 }
@@ -72,7 +72,7 @@ MODEL_PROVIDERS = {
     "deepseek-r1:1.5B": "ollama",
     "llama3.2": "ollama",
     "llama-3.3-70b-groq": "groq",
-    "gemini-2.5-flash": "gemini",
+    "gemini-3.6-flash": "gemini",
     "gpt-4o": "openai",
     "gpt-4o-github": "github",
 }
@@ -518,7 +518,7 @@ def generate_llm_response(
     Args:
         prompt:     The prompt string to send to the model.
         model_name: A model ID string from llm_utils.MODELS values
-                    (e.g. 'gemini-2.5-flash', 'llama3.2').
+                    (e.g. 'gemini-3.6-flash', 'llama3.2').
         api_url:    Ollama API URL. Only used when provider is 'ollama'.
         force_json: When True, instructs Ollama to constrain its output to
                     valid JSON. Set this only when the caller will parse the
@@ -668,7 +668,7 @@ def generate_gemini_response(prompt: str, api_key: str) -> str:
     Returns:
         Complete text response from the model
     """
-    model_id = "gemini-2.5-flash"
+    model_id = "gemini-3.6-flash"
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
     
     messages = [
@@ -1003,7 +1003,7 @@ def _stream_gemini_chat(
         does not support streaming in the same way as OpenAI-compatible APIs,
         so the full response is returned at once.
     """
-    model_id = "gemini-2.5-flash"
+    model_id = "gemini-3.6-flash"
     endpoint = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model_id}:generateContent?key={api_key}"

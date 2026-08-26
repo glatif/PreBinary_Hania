@@ -1506,7 +1506,7 @@ def _render_oral_exam_grading(assessment_id: int) -> None:
 
     if selected_model == "llama-3.3-70b-groq" and not st.session_state.get("groq_api_key"):
         st.warning("⚠️ Groq API key is required. Please add your API key in your profile settings.")
-    if selected_model == "gemini-2.5-flash" and not st.session_state.get("gemini_api_key"):
+    if selected_model == "gemini-3.6-flash" and not st.session_state.get("gemini_api_key"):
         st.warning("⚠️ Gemini API key is required. Please add your API key in your profile settings.")
 
     st.caption(

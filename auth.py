@@ -790,7 +790,7 @@ def update_user_model_prefs(
 
     Called from the Profile → Model Preferences tab when the user saves their
     preferred model for each UReap feature. Preferences are stored as model ID
-    strings (e.g. 'gemini-2.5-flash'), not display names, so they can be used
+    strings (e.g. 'gemini-3.6-flash'), not display names, so they can be used
     directly with llm_utils.stream_llm() without a reverse lookup.
 
     Passing None for any preference stores NULL in the database, which causes

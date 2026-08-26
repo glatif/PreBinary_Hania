@@ -1384,7 +1384,7 @@ def _render_login_form():
 
             # Load per-feature model preferences into each feature's internal
             # session state key. Values are model ID strings (e.g.
-            # 'gemini-2.5-flash'). A NULL or unrecognised value falls back to
+            # 'gemini-3.6-flash'). A NULL or unrecognised value falls back to
             # the first entry in LLM_MODELS.
             _load_model_preferences(result)
 

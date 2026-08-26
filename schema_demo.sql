@@ -67,7 +67,7 @@ USE streamlit_database;
 --
 -- pref_model_* columns store each user's preferred LLM for each UReap feature.
 -- NULL means no preference set; the application falls back to the first model
--- in llm_utils.MODELS. Values are model ID strings (e.g. 'gemini-2.5-flash'),
+-- in llm_utils.MODELS. Values are model ID strings (e.g. 'gemini-3.6-flash'),
 -- not display names.
 --
 -- pref_model_video_lectures is stored in the same column family and is loaded
