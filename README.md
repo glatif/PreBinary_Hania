@@ -522,12 +522,14 @@ For detailed information about each feature, refer to the specific documentation
 
 For running locally, see [Setup Instructions](#setup-instructions) above. To deploy to a production Ubuntu server using Docker, follow these steps. Full details, troubleshooting, and firewall notes are in `DEPLOYMENT.md`.
 
-**Current server:** Ubuntu (Docker), `144.217.80.160`, app served at `http://144.217.80.160:8501`. Access is via SSH (PuTTY) and SFTP (WinSCP). Credentials are kept in the team's password manager / server `.env` file, not in the repo.
+**Current server:** Ubuntu (Docker), `144.217.80.160`, app served at `https://144-217-80-160.sslip.io` (see step 11 — camera/mic access requires HTTPS, so use this URL, not the bare `http://144.217.80.160:8501` one, for anything involving the ID/selfie verification or proctoring webcam). Access is via SSH (PuTTY) and SFTP (WinSCP). Credentials are kept in the team's password manager / server `.env` file, not in the repo.
 
 > **Note:** This replaces the earlier IONOS server (`74.208.142.195`), which is no longer the deployment target.
 
+> **Note:** This VPS is shared with other `hz`-managed projects (`hz-faculty-desk`, `hz-living-heritage`) that already have nginx vhosts in `/etc/nginx/sites-enabled/`, with `hz-living-heritage` as the `default_server` on port 80. Don't bind port 80/443 directly from Docker (e.g. Caddy) on this box — it will conflict. Add a new nginx vhost instead (step 11) and leave the existing sites alone.
+
 1. **Install local tools** — [PuTTY](https://www.putty.org/) (SSH client) and [WinSCP](https://winscp.net/) (SFTP client).
-2. **Connect to the server** — open PuTTY, host `144.217.80.160`, port `22`, log in as `root`.
+2. **Connect to the server** — open PuTTY, host `144.217.80.160`, port `22`. Log in as `root` if you have that password; otherwise log in as the sudo-enabled user you were given (e.g. `hh_horaizon`) and prefix admin commands below with `sudo`.
 3. **Initial server setup (one-time)** — `apt update && apt upgrade -y`, reboot if prompted, then add a swap file (recommended for low-RAM servers running ML dependencies).
 4. **Install Docker** — add Docker's official apt repo and GPG key, then `apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`. If `docker.service` fails with a socket-activation error, run `systemctl enable docker.socket && systemctl start docker.socket && systemctl start docker.service`.
 5. **Configure the firewall** — `ufw allow OpenSSH`, `ufw allow 8501/tcp`, `ufw allow 80/tcp`, `ufw allow 443/tcp`, then `ufw --force enable`. ⚠️ If the app still isn't reachable publicly afterward, check for a **provider-level firewall** in your hosting control panel — `ufw` rules alone are not enough.
@@ -550,6 +552,47 @@ For running locally, see [Setup Instructions](#setup-instructions) above. To dep
     ```bash
     docker exec -it app-db-1 mysql -u streamlit_user -p streamlit_database -e "SHOW TABLES;"
     ```
+11. **Set up HTTPS (required for camera/mic access)** — browsers only allow `getUserMedia` (camera/mic, used by identity verification and proctoring) on a secure context: `https://` or `http://localhost`. The bare `http://144.217.80.160:8501` URL from step 10 will never show a permission prompt for students. Since this server already runs nginx for other `hz` projects (see note above), add PreBinary as a new vhost rather than exposing port 8501 or binding 80/443 from Docker:
+    - No domain needed — [sslip.io](https://sslip.io) gives a free public hostname that resolves straight to the server IP: `144-217-80-160.sslip.io`. (Swap in a real subdomain later if the team gets one.)
+    - Create `/etc/nginx/sites-available/prebinary`:
+      ```nginx
+      # managed by hz — prebinary on port 80 (144-217-80-160.sslip.io)
+      server {
+          listen 80;
+          listen [::]:80;
+          server_name 144-217-80-160.sslip.io;
+          client_max_body_size 512M;
+
+          location / {
+              proxy_pass http://127.0.0.1:8501;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $http_host;
+              proxy_set_header X-Forwarded-Host $http_host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_cache_bypass $http_upgrade;
+              proxy_read_timeout 300s;
+              proxy_send_timeout 300s;
+          }
+      }
+      ```
+    - Enable it and reload nginx:
+      ```bash
+      sudo ln -s /etc/nginx/sites-available/prebinary /etc/nginx/sites-enabled/prebinary
+      sudo nginx -t
+      sudo systemctl reload nginx
+      ```
+    - Install Certbot's nginx plugin and issue the certificate (this edits the `prebinary` vhost in place to add the SSL block and HTTP→HTTPS redirect — it does not touch `hz-faculty-desk` or `hz-living-heritage`):
+      ```bash
+      sudo apt update
+      sudo apt install -y certbot python3-certbot-nginx
+      sudo certbot --nginx -d 144-217-80-160.sslip.io
+      ```
+    - Verify: `curl -I https://144-217-80-160.sslip.io` should return `HTTP/2 200`, and the URL should load with a valid padlock in a browser.
+    - Once confirmed working, consider closing port 8501 to the public internet (`sudo ufw delete allow 8501/tcp`) so the app is only reachable through the HTTPS vhost.
 
 ### Common Operations
 
@@ -578,4 +621,4 @@ For running locally, see [Setup Instructions](#setup-instructions) above. To dep
 - Each server has its own independent MySQL database (via the Docker `db` service) — user accounts, courses, and any password changes made on one server (including local development) do **not** carry over to another. Always confirm which server/database you're testing against before assuming a login or data change applies everywhere.
 - If a new server has more RAM, the swap file (step 3) is optional but still a good safety net.
 - Confirm whether a new server's provider also has a separate network-level firewall before assuming `ufw` rules are sufficient.
-- Consider adding a reverse proxy (Nginx) + SSL/domain at this stage instead of exposing port `8501` directly.
+- Set up HTTPS via an nginx reverse proxy (step 11) instead of exposing port `8501` directly — required for camera/mic access, and doubly important on a shared server where port 80/443 may already be owned by another project's nginx/Caddy setup.
