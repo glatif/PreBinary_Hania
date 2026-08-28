@@ -26,6 +26,7 @@
 #   from st.session_state at call time, populated at login by app.py.
 # =============================================================================
 
+import base64
 import json
 import requests
 from typing import Dict, Generator, Any
@@ -244,15 +245,66 @@ def _transcribe_audio_openai_compatible(
         return f"Error: Failed to transcribe audio via {provider_label}. Details: {str(e)}"
 
 
+_GEMINI_AUDIO_MIME_TYPES = {
+    "wav": "audio/wav",
+    "webm": "audio/webm",
+    "mp4": "audio/mp4",
+    "m4a": "audio/mp4",
+    "mp3": "audio/mp3",
+    "ogg": "audio/ogg",
+}
+
+
+def _transcribe_audio_gemini(audio_bytes: bytes, filename: str, api_key: str) -> str:
+    """
+    Transcribe audio via Gemini's multimodal generateContent endpoint.
+
+    Gemini has no dedicated Whisper-style /audio/transcriptions endpoint;
+    audio is instead sent as inline_data alongside a text prompt instructing
+    the model to transcribe it verbatim.
+
+    Returns:
+        The transcript text, or an error string prefixed with 'Error:'.
+    """
+    model_id = "gemini-3.6-flash"
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    mime_type = _GEMINI_AUDIO_MIME_TYPES.get(ext, "audio/wav")
+
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": "Transcribe this audio verbatim. Return only the transcript text, with no commentary or formatting."},
+                {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(audio_bytes).decode("utf-8")}},
+            ],
+        }],
+        "generationConfig": {"responseMimeType": "text/plain"},
+    }
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        result = response.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except requests.exceptions.RequestException as e:
+        return f"Error: Failed to transcribe audio via Gemini. Details: {str(e)}"
+
+
 def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
     """
     Transcribe a spoken answer to text, used by the Oral Examination feature.
 
     Dispatches to whichever speech-to-text provider the current user has an
-    API key for, preferring Groq (faster, cheaper) over OpenAI. Mirrors the
-    'Error: ...' string convention used by generate_llm_response() and
-    friends so callers can display the result directly without a separate
-    error-handling path.
+    API key for, preferring Groq (faster, cheaper, dedicated Whisper
+    endpoint), then Gemini, then OpenAI last — OpenAI is tried last since a
+    single stale OpenAI key is the most common source of 401s here, and
+    should not block a working Gemini/Groq key from being tried first.
+    Mirrors the 'Error: ...' string convention used by generate_llm_response()
+    and friends so callers can display the result directly without a
+    separate error-handling path.
 
     Args:
         audio_bytes: Raw audio file bytes — WAV (st.audio_input) or webm/mp4
@@ -270,6 +322,8 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
             model="whisper-large-v3-turbo",
             provider_label="Groq",
         )
+    if st.session_state.get("gemini_api_key"):
+        return _transcribe_audio_gemini(audio_bytes, filename, st.session_state.gemini_api_key)
     if st.session_state.get("openai_api_key"):
         return _transcribe_audio_openai_compatible(
             audio_bytes, filename, st.session_state.openai_api_key,
@@ -278,8 +332,8 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
             provider_label="OpenAI",
         )
     return (
-        "Error: No speech-to-text provider configured. Add a Groq or OpenAI "
-        "API key in your profile settings."
+        "Error: No speech-to-text provider configured. Add a Groq, OpenAI, "
+        "or Gemini API key in your profile settings."
     )
 
 
