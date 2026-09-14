@@ -55,6 +55,10 @@ keys.txt
 data/oral_examination/
 data/verification_photos/
 
+# exam_verification's local accuracy-eval manifest — real ID-card and selfie
+# photos used to test evaluate_verification.py, kept out of version control.
+src/features/exam_verification/test_data/
+
 # Data files (uncomment if you don't want to include data files in your repository)
 data/
 

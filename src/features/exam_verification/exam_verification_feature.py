@@ -35,6 +35,7 @@
 
 import re
 import difflib
+import unicodedata
 import uuid
 from datetime import date
 from pathlib import Path
@@ -137,6 +138,13 @@ DOCUMENT_TYPE_LABELS = {
 _EXPIRING_DOCUMENT_TYPES = {"bc_drivers_licence", "bc_services_card_or_bcid", "other_gov_id"}
 
 
+_OTHER_PROVINCE_NAMES = [
+    "ONTARIO", "ALBERTA", "SASKATCHEWAN", "MANITOBA", "QUEBEC", "NEW BRUNSWICK",
+    "NOVA SCOTIA", "PRINCE EDWARD ISLAND", "NEWFOUNDLAND AND LABRADOR", "YUKON",
+    "NORTHWEST TERRITORIES", "NUNAVUT",
+]
+
+
 def detect_document_type(ocr_text: str) -> str:
     """
     Guess which kind of ID document was scanned, from keywords commonly
@@ -147,6 +155,12 @@ def detect_document_type(ocr_text: str) -> str:
     miscategorized as a passport/out-of-province licence. Falls back to
     "student_card" when nothing matches, so plain institution cards (which
     don't carry any of these keywords) keep working exactly as before.
+
+    An out-of-province driver's licence is matched by province name (e.g.
+    "ONTARIO") plus a driver/licence keyword, not by requiring "CANADA" —
+    real provincial licences print the province's name prominently on the
+    front but typically don't print "CANADA" there at all, so a CANADA-only
+    rule would misclassify them as student cards (the fallback bucket).
     """
     norm = _normalize(ocr_text)
 
@@ -162,28 +176,58 @@ def detect_document_type(ocr_text: str) -> str:
     ):
         return "bc_services_card_or_bcid"
 
-    if _fuzzy_contains(norm, _normalize("CANADA")) and (
-        _fuzzy_contains(norm, _normalize("PASSPORT"))
-        or _fuzzy_contains(norm, _normalize("DRIVER"))
+    has_driver_or_licence_keyword = (
+        _fuzzy_contains(norm, _normalize("DRIVER"))
         or _fuzzy_contains(norm, _normalize("LICENCE"))
         or _fuzzy_contains(norm, _normalize("LICENSE"))
+    )
+
+    if _fuzzy_contains(norm, _normalize("CANADA")) and (
+        _fuzzy_contains(norm, _normalize("PASSPORT")) or has_driver_or_licence_keyword
+    ):
+        return "other_gov_id"
+
+    if has_driver_or_licence_keyword and any(
+        _fuzzy_contains(norm, _normalize(province)) for province in _OTHER_PROVINCE_NAMES
     ):
         return "other_gov_id"
 
     return "student_card"
 
 
-# Matches an EXP/EXPIRY label followed by a date in either YYYY/MM/DD
-# (numeric month) or YYYY/MMM/DD (3-letter month abbreviation) form — the
-# two formats ICBC/BC government cards print expiry and birth dates in.
+# Matches an EXP/EXPIRY label followed by a date in YYYY/MM/DD (numeric
+# month), YYYY/MMM/DD (3-5 letter month abbreviation), or the bilingual
+# YYYY/MMM/MMM/DD form Canadian federal documents print (e.g. "MAY/MAI") —
+# the second month token is optional and unused; matching either language's
+# token in the first slot is enough to resolve the month.
 _EXPIRY_PATTERN = re.compile(
-    r"EXP[A-Z]*[.:\s]+(\d{4})[/\-\s]([A-Z]{3}|\d{1,2})[/\-\s](\d{1,2})"
+    r"EXP[A-Z]*[.:\s]+(\d{4})[/\-\s]+"
+    r"(?:(\d{1,2})|([A-Z]{3,5})(?:[/\-\s]+[A-Z]{3,5})?)"
+    r"[/\-\s]+(\d{1,2})"
 )
 
 _MONTH_ABBREVIATIONS = {
+    # English
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+    # French — Canadian federal documents (passports) and some provincial
+    # cards print both official languages, e.g. "EXP 2030/MAY/MAI/13", or
+    # occasionally just the French form alone. OCT/NOV/DEC are shared with
+    # English once accents are stripped (see _strip_accents below).
+    "JANV": 1, "FEV": 2, "MARS": 3, "AVR": 4, "MAI": 5, "JUIN": 6,
+    "JUIL": 7, "AOUT": 8, "SEPT": 9,
 }
+
+
+def _strip_accents(text: str) -> str:
+    """
+    Fold accented Latin letters (FÉV, AOÛT, DÉC on bilingual Canadian
+    documents) down to plain ASCII so the expiry regex — which only
+    matches [A-Z] — can see them.
+    """
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch)
+    )
 
 
 def _extract_expiry_date(ocr_text: str):
@@ -195,15 +239,15 @@ def _extract_expiry_date(ocr_text: str):
     small printed date cleanly. Callers treat None as inconclusive, not as
     a failure.
     """
-    match = _EXPIRY_PATTERN.search(ocr_text.upper())
+    match = _EXPIRY_PATTERN.search(_strip_accents(ocr_text.upper()))
     if not match:
         return None
-    year_str, month_str, day_str = match.groups()
-    month = _MONTH_ABBREVIATIONS.get(month_str)
-    if month is None:
-        try:
-            month = int(month_str)
-        except ValueError:
+    year_str, numeric_month, alpha_month, day_str = match.groups()
+    if numeric_month is not None:
+        month = int(numeric_month)
+    else:
+        month = _MONTH_ABBREVIATIONS.get(alpha_month)
+        if month is None:
             return None
     try:
         return date(int(year_str), month, int(day_str))
