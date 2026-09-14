@@ -18,7 +18,7 @@ from src.utils.rag_utils import (
     load_resources,
     get_relevant_context,
 )
-from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, stream_llm, stream_llm_chat
+from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, stream_llm, stream_llm_chat, missing_key_warning
 from src.features.quiz_generator.document_processor import (
     process_uploaded_files,
     validate_extracted_content,
@@ -1054,13 +1054,13 @@ def _render_chat_tab():
     # ── API key warnings ──────────────────────────────────────────────────────
     provider = MODEL_PROVIDERS.get(selected_model, "")
     if provider == "groq" and not st.session_state.get("groq_api_key"):
-        st.warning("⚠️ Groq API key is required. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("Groq API key"))
     if provider == "gemini" and not st.session_state.get("gemini_api_key"):
-        st.warning("⚠️ Gemini API key is required. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("Gemini API key"))
     if provider == "openai" and not st.session_state.get("openai_api_key"):
-        st.warning("⚠️ OpenAI API key is required. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("OpenAI API key"))
     if provider == "github" and not st.session_state.get("github_token"):
-        st.warning("⚠️ GitHub token is required. Please add your GitHub token in your profile settings.")
+        st.warning(missing_key_warning("GitHub token"))
 
     # Show which documents are currently loaded in the active index.
     filenames = rag_index.get("indexed_filenames", [])

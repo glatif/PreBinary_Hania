@@ -50,7 +50,7 @@ from typing import List, Dict, Any
 from db import get_connection
 from auth import save_uploaded_file
 
-from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, generate_llm_response, strip_llm_json, transcribe_audio
+from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, generate_llm_response, strip_llm_json, transcribe_audio, missing_key_warning
 from src.features.exam_verification.exam_verification_feature import (
     verify_student_identity,
     get_verification_admin_settings,
@@ -864,17 +864,24 @@ def _render_student_oral_exam(
         "advance."
     )
 
-    # Spoken answers are transcribed via Groq or OpenAI's Whisper endpoint
-    # (see transcribe_audio() in llm_utils.py) — there's no offline/local
+    # Spoken answers are transcribed via Groq, Gemini, or OpenAI (see
+    # transcribe_audio() in llm_utils.py) — there's no offline/local
     # transcription option. Checked here, before identity verification and
     # recording, so a student finds out up front rather than after already
     # completing the camera verification and recording an answer that can't
-    # be transcribed.
-    if not st.session_state.get("groq_api_key") and not st.session_state.get("openai_api_key"):
+    # be transcribed. Students draw on the admin account's keys (flattened
+    # into session state at login, see get_admin_api_keys() in auth.py), so
+    # reaching this branch means the admin hasn't configured any of the
+    # three providers yet — not that the student is missing a key of their own.
+    if (
+        not st.session_state.get("groq_api_key")
+        and not st.session_state.get("gemini_api_key")
+        and not st.session_state.get("openai_api_key")
+    ):
         st.warning(
-            "⚠️ This oral exam requires a Groq or OpenAI API key on your account to transcribe "
-            "your spoken answers — neither is set. Go to **Profile → AI API Keys**, save a Groq "
-            "or OpenAI key, then come back here to start the exam."
+            "⚠️ This oral exam requires a Groq, Gemini, or OpenAI API key to transcribe "
+            "spoken answers, and none is currently configured. Contact your administrator "
+            "to have one set up, then come back here to start the exam."
         )
         return
 
@@ -1505,9 +1512,9 @@ def _render_oral_exam_grading(assessment_id: int) -> None:
     selected_model = MODELS[selected_model_key]
 
     if selected_model == "llama-3.3-70b-groq" and not st.session_state.get("groq_api_key"):
-        st.warning("⚠️ Groq API key is required. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("Groq API key"))
     if selected_model == "gemini-3.6-flash" and not st.session_state.get("gemini_api_key"):
-        st.warning("⚠️ Gemini API key is required. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("Gemini API key"))
 
     st.caption(
         "Each answer is graded with one LLM call, one at a time — a full class "

@@ -558,6 +558,38 @@ def login_user(username: str, password: str):
     return None
 
 
+def get_admin_api_keys() -> dict:
+    """
+    Fetch the AI provider keys stored on the admin account.
+
+    Students and teachers no longer supply their own keys (see profile_page()
+    in app.py) — every LLM/TTS call they trigger is billed through this one
+    admin-managed set of credentials instead. Ordered by id so the result is
+    deterministic if more than one admin account exists.
+
+    Returns:
+        dict with chatgpt_api_key, gemini_api_key, groq_api_key, github_token,
+        elevenlabs_api_key, and cartesia_api_key — all None if no admin
+        account exists or none of its keys are set.
+    """
+    conn   = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        """
+        SELECT chatgpt_api_key, gemini_api_key, groq_api_key,
+               github_token, elevenlabs_api_key, cartesia_api_key
+        FROM users WHERE role = 'admin' ORDER BY id LIMIT 1
+        """
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row or {
+        "chatgpt_api_key": None, "gemini_api_key": None, "groq_api_key": None,
+        "github_token": None, "elevenlabs_api_key": None, "cartesia_api_key": None,
+    }
+
+
 def update_user_permissions(user_id: int, new_role: str, new_status: str) -> None:
     """
     Update a user's role and status.

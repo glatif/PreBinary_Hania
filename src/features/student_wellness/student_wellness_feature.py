@@ -6,7 +6,7 @@ import uuid
 from db import get_connection
 
 # Import our utility modules
-from src.utils.llm_utils import stream_llm, stream_llm_chat, MODELS, MODEL_PROVIDERS
+from src.utils.llm_utils import stream_llm, stream_llm_chat, MODELS, MODEL_PROVIDERS, missing_key_warning
 from src.features.student_wellness.wellness_data import (
     create_wellness_system_message,
     get_services_by_category,
@@ -338,22 +338,22 @@ def process_wellness_query(user_input: str):
         "groq_api_key" not in st.session_state or not st.session_state.groq_api_key
     ):
         can_use_model = False
-        error_message = "⚠️ Groq API key is required. Please add your API key in your profile settings."
+        error_message = missing_key_warning("Groq API key")
     elif model_provider == "gemini" and (
         "gemini_api_key" not in st.session_state or not st.session_state.gemini_api_key
     ):
         can_use_model = False
-        error_message = "⚠️ Google Gemini API key is required. Please add your API key in your profile settings."
+        error_message = missing_key_warning("Google Gemini API key")
     elif model_provider == "openai" and (
         "openai_api_key" not in st.session_state or not st.session_state.openai_api_key
     ):
         can_use_model = False
-        error_message = "⚠️ OpenAI API key is required. Please add your API key in your profile settings."
+        error_message = missing_key_warning("OpenAI API key")
     elif model_provider == "github" and (
         "github_token" not in st.session_state or not st.session_state.github_token
     ):
         can_use_model = False
-        error_message = "⚠️ GitHub token is required. Please add your GitHub token in your profile settings."
+        error_message = missing_key_warning("GitHub token")
 
     if not can_use_model:
         st.session_state.wellness_chat_history.append({"role": "assistant", "content": error_message})
@@ -536,22 +536,22 @@ def render_wellness_chat():
     if model_provider == "groq" and (
         "groq_api_key" not in st.session_state or not st.session_state.groq_api_key
     ):
-        st.warning("⚠️ Groq API key is required for this model. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("Groq API key"))
 
     if model_provider == "gemini" and (
         "gemini_api_key" not in st.session_state or not st.session_state.gemini_api_key
     ):
-        st.warning("⚠️ Google Gemini API key is required for this model. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("Google Gemini API key"))
 
     if model_provider == "openai" and (
         "openai_api_key" not in st.session_state or not st.session_state.openai_api_key
     ):
-        st.warning("⚠️ OpenAI API key is required for this model. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("OpenAI API key"))
 
     if model_provider == "github" and (
         "github_token" not in st.session_state or not st.session_state.github_token
     ):
-        st.warning("⚠️ GitHub token is required for this model. Please add your GitHub token in your profile settings.")
+        st.warning(missing_key_warning("GitHub token"))
 
     if st.button("New Chat", key="wellness_new_chat"):
         st.session_state["wellness_chat_history"] = []

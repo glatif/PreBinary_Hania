@@ -43,7 +43,7 @@ from sqlalchemy import text
 from db import get_connection, get_engine
 from auth import save_uploaded_file, delete_physical_file
 
-from src.utils.llm_utils import stream_llm, MODELS, MODEL_PROVIDERS
+from src.utils.llm_utils import stream_llm, MODELS, MODEL_PROVIDERS, missing_key_warning
 from src.features.quiz_generator.document_processor import (
     process_uploaded_files,
     combine_extracted_texts,
@@ -776,13 +776,13 @@ def render_data_input_tab(
     model_provider    = MODEL_PROVIDERS.get(selected_model_id, "")
 
     if model_provider == "groq" and not st.session_state.get("groq_api_key"):
-        st.warning("⚠️ Groq API key is required for this model. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("Groq API key"))
     if model_provider == "gemini" and not st.session_state.get("gemini_api_key"):
-        st.warning("⚠️ Google Gemini API key is required for this model. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("Google Gemini API key"))
     if model_provider == "openai" and not st.session_state.get("openai_api_key"):
-        st.warning("⚠️ OpenAI API key is required for this model. Please add your API key in your profile settings.")
+        st.warning(missing_key_warning("OpenAI API key"))
     if model_provider == "github" and not st.session_state.get("github_token"):
-        st.warning("⚠️ GitHub token is required for this model. Please add your GitHub token in your profile settings.")
+        st.warning(missing_key_warning("GitHub token"))
 
     # ── Generate ─────────────────────────────────────────────────────────────
     st.markdown("---")

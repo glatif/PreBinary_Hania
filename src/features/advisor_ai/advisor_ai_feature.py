@@ -48,7 +48,7 @@ from db import get_connection, get_engine
 # LLM interface — stream_llm_chat is used for multi-turn conversation,
 # stream_llm for single-turn. MODELS and MODEL_PROVIDERS drive the model
 # selector and provider dispatch.
-from src.utils.llm_utils import stream_llm, stream_llm_chat, MODELS, MODEL_PROVIDERS
+from src.utils.llm_utils import stream_llm, stream_llm_chat, MODELS, MODEL_PROVIDERS, missing_key_warning
 
 # Embedding model wrapper used to encode query text for FAISS similarity search.
 from src.utils.embedding_wrapper import get_embedding_model, DEFAULT_MODEL_NAME
@@ -679,16 +679,16 @@ def advisor_ai_ui():
         model_provider = MODEL_PROVIDERS.get(selected_model_id, "")
         
         if model_provider == "groq" and ("groq_api_key" not in st.session_state or not st.session_state.groq_api_key):
-            st.warning("⚠️ Groq API key is required for this model. Please add your API key in your profile settings.")
-        
+            st.warning(missing_key_warning("Groq API key"))
+
         if model_provider == "gemini" and ("gemini_api_key" not in st.session_state or not st.session_state.gemini_api_key):
-            st.warning("⚠️ Google Gemini API key is required for this model. Please add your API key in your profile settings.")
-        
+            st.warning(missing_key_warning("Google Gemini API key"))
+
         if model_provider == "openai" and ("openai_api_key" not in st.session_state or not st.session_state.openai_api_key):
-            st.warning("⚠️ OpenAI API key is required for this model. Please add your API key in your profile settings.")
-        
+            st.warning(missing_key_warning("OpenAI API key"))
+
         if model_provider == "github" and ("github_token" not in st.session_state or not st.session_state.github_token):
-            st.warning("⚠️ GitHub token is required for this model. Please add your GitHub token in your profile settings.")
+            st.warning(missing_key_warning("GitHub token"))
         
         # Load resources if not already loaded
         if not st.session_state.advisor_resources_loaded:
@@ -787,16 +787,16 @@ def process_advisor_query(user_input):
 
     if model_provider == "groq" and ("groq_api_key" not in st.session_state or not st.session_state.groq_api_key):
         can_use_model = False
-        error_message = "⚠️ Groq API key is required. Please add your API key in your profile settings."
+        error_message = missing_key_warning("Groq API key")
     elif model_provider == "gemini" and ("gemini_api_key" not in st.session_state or not st.session_state.gemini_api_key):
         can_use_model = False
-        error_message = "⚠️ Google Gemini API key is required. Please add your API key in your profile settings."
+        error_message = missing_key_warning("Google Gemini API key")
     elif model_provider == "openai" and ("openai_api_key" not in st.session_state or not st.session_state.openai_api_key):
         can_use_model = False
-        error_message = "⚠️ OpenAI API key is required. Please add your API key in your profile settings."
+        error_message = missing_key_warning("OpenAI API key")
     elif model_provider == "github" and ("github_token" not in st.session_state or not st.session_state.github_token):
         can_use_model = False
-        error_message = "⚠️ GitHub token is required. Please add your GitHub token in your profile settings."
+        error_message = missing_key_warning("GitHub token")
 
     if not can_use_model:
         st.session_state.advisor_chat_history.append({"role": "assistant", "content": error_message})

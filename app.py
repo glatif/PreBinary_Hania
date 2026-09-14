@@ -97,6 +97,7 @@ from auth import (
     is_username_unique_for_update,
     is_email_unique_for_update,
     update_user_api_keys,
+    get_admin_api_keys,
     update_user_model_prefs,
     generate_temp_password,
     send_temp_password_email,
@@ -1351,6 +1352,12 @@ def _render_login_form():
                        when calling OpenAI. It is mapped from chatgpt_api_key,
                        which is the column name used in the Prebinary users table.
 
+    Students and teachers no longer bring their own AI provider keys — every
+    non-admin login is flattened from get_admin_api_keys() instead of the
+    logged-in user's own row, so all LLM/TTS calls are billed through the
+    single admin account regardless of what (if anything) is saved on the
+    student/teacher's own record. Only an admin's own login uses its own row.
+
     Per-feature model preferences are loaded from the pref_model_* columns into
     the internal session state keys that each UReap feature module reads. NULL
     preferences fall back to the first model in llm_utils.MODELS.
@@ -1369,18 +1376,26 @@ def _render_login_form():
             st.session_state.logged_in = True
             st.session_state.user = result
 
+            # Students and teachers no longer manage their own AI provider
+            # keys (see profile_page()) — they draw on the admin account's
+            # keys instead, regardless of what's saved on their own row.
+            # Only an admin uses its own row here.
+            key_source = result if result.get("role") == "admin" else get_admin_api_keys()
+
             # Bridge the naming difference between Prebinary's chatgpt_api_key
             # column and UReap's openai_api_key session state key. Both refer
             # to the same OpenAI credential; only the name differs.
-            st.session_state["openai_api_key"] = result.get("chatgpt_api_key")
+            st.session_state["openai_api_key"] = key_source.get("chatgpt_api_key")
 
             # Flatten UReap API key session state keys to the root level.
             # llm_utils.py reads these directly from st.session_state (e.g.
             # st.session_state.groq_api_key), not from st.session_state.user,
             # so they must be present at the top level of session state.
-            st.session_state["groq_api_key"]       = result.get("groq_api_key")
-            st.session_state["gemini_api_key"]      = result.get("gemini_api_key")
-            st.session_state["github_token"]        = result.get("github_token")
+            st.session_state["groq_api_key"]       = key_source.get("groq_api_key")
+            st.session_state["gemini_api_key"]      = key_source.get("gemini_api_key")
+            st.session_state["github_token"]        = key_source.get("github_token")
+            st.session_state["elevenlabs_api_key"]  = key_source.get("elevenlabs_api_key")
+            st.session_state["cartesia_api_key"]    = key_source.get("cartesia_api_key")
 
             # Load per-feature model preferences into each feature's internal
             # session state key. Values are model ID strings (e.g.
@@ -1539,11 +1554,157 @@ def _render_signup_form():
 # PROFILE PAGE
 # =============================================================================
 
+def _render_own_api_keys_form(user: dict) -> None:
+    """
+    AI API Keys tab content — admin accounts only.
+
+    Students and teachers no longer maintain their own keys here; every
+    LLM/TTS call they trigger draws on this same set of keys via
+    get_admin_api_keys(), flattened into session state at login. Each key
+    field shows a saved/not-saved indicator so the admin knows whether a key
+    is currently stored without revealing its value.
+    """
+    st.subheader("AI API Keys")
+    st.caption(
+        "API keys are stored on this admin account and used by AI features "
+        "for every user throughout the application — students and teachers "
+        "no longer provide their own."
+    )
+
+    chatgpt_saved    = bool(user.get("chatgpt_api_key"))
+    gemini_saved     = bool(user.get("gemini_api_key"))
+    groq_saved       = bool(user.get("groq_api_key"))
+    github_saved     = bool(user.get("github_token"))
+    elevenlabs_saved = bool(user.get("elevenlabs_api_key"))
+    cartesia_saved   = bool(user.get("cartesia_api_key"))
+
+    with st.form("api_keys_form"):
+        st.markdown("**LLM Provider Keys**")
+        k1, k2 = st.columns(2)
+        with k1:
+            # chatgpt_api_key doubles as the OpenAI key for UReap.
+            # UReap reads st.session_state.openai_api_key at runtime,
+            # which is populated from this column at login.
+            cgpt = st.text_input(
+                "ChatGPT / OpenAI API Key",
+                value=user.get("chatgpt_api_key") or "",
+                type="password",
+                placeholder="Enter API key",
+            )
+            groq = st.text_input(
+                "Groq API Key",
+                value=user.get("groq_api_key") or "",
+                type="password",
+                placeholder="Enter API key",
+                help="Used for Llama 3.3-70B via the Groq inference API.",
+            )
+        with k2:
+            gem = st.text_input(
+                "Google Gemini API Key",
+                value=user.get("gemini_api_key") or "",
+                type="password",
+                placeholder="Enter API key",
+            )
+            github = st.text_input(
+                "GitHub Token",
+                value=user.get("github_token") or "",
+                type="password",
+                placeholder="Enter API key",
+                help="Used for GPT-4o via GitHub Models.",
+            )
+
+        st.divider()
+        st.markdown("**Text-to-Speech Keys**")
+        tts1, tts2 = st.columns(2)
+        with tts1:
+            elevenlabs = st.text_input(
+                "ElevenLabs API Key",
+                value=user.get("elevenlabs_api_key") or "",
+                type="password",
+                placeholder="Enter API key",
+            )
+        with tts2:
+            cartesia = st.text_input(
+                "Cartesia API Key",
+                value=user.get("cartesia_api_key") or "",
+                type="password",
+                placeholder="Enter API key",
+            )
+
+        save_keys = st.form_submit_button("Save API Keys", type="primary")
+
+    if save_keys:
+        # Blank strings are stored as None so the not-set indicator works
+        # correctly on the next render.
+        cgpt       = cgpt.strip()       or None
+        gem        = gem.strip()        or None
+        groq       = groq.strip()       or None
+        github     = github.strip()     or None
+        elevenlabs = elevenlabs.strip() or None
+        cartesia   = cartesia.strip()   or None
+
+        api_key_errors = [
+            validate_api_key(cgpt,       "ChatGPT / OpenAI"),
+            validate_api_key(gem,        "Gemini"),
+            validate_api_key(groq,       "Groq"),
+            validate_api_key(github,     "GitHub Token"),
+            validate_api_key(elevenlabs, "ElevenLabs"),
+            validate_api_key(cartesia,   "Cartesia"),
+        ]
+        api_key_errors = [msg for msg in api_key_errors if msg]
+        if api_key_errors:
+            # Display errors without returning early so all other tabs
+            # remain accessible.
+            show_errors(api_key_errors)
+        else:
+            update_user_api_keys(
+                user["id"], cgpt, gem, groq, github, elevenlabs, cartesia
+            )
+            st.session_state.user.update({
+                "chatgpt_api_key":    cgpt,
+                "gemini_api_key":     gem,
+                "groq_api_key":       groq,
+                "github_token":       github,
+                "elevenlabs_api_key": elevenlabs,
+                "cartesia_api_key":   cartesia,
+            })
+            # Keep the session state root-level keys in sync so that
+            # llm_utils.py, which reads these directly from st.session_state
+            # (not from st.session_state.user), picks up the updated values.
+            # Since this form is admin-only, this admin's own keys are also
+            # what every student/teacher session reads via
+            # get_admin_api_keys() — but only from their next login, not
+            # retroactively for sessions already in progress.
+            st.session_state["openai_api_key"] = cgpt
+            st.session_state["groq_api_key"]   = groq
+            st.session_state["gemini_api_key"] = gem
+            st.session_state["github_token"]   = github
+            st.session_state["elevenlabs_api_key"] = elevenlabs
+            st.session_state["cartesia_api_key"]   = cartesia
+            st.toast("API keys saved.")
+            st.rerun()
+
+    # ── API key links ─────────────────────────────────────────────────────
+    st.divider()
+    st.write("Enter your API keys to use cloud-based models:")
+    st.markdown("""
+🔑 Get your API keys:
+- [OpenAI API Key](https://platform.openai.com/api-keys)
+- [GitHub Token](https://github.com/settings/personal-access-tokens)
+- [Gemini API Key](https://aistudio.google.com/apikey)
+- [Groq API Key](https://console.groq.com/keys)
+""")
+
+
 def profile_page():
     """
     User profile and settings page, accessible from the sidebar navigation.
     Organised into five tabs: Personal Information, API Keys, Model Preferences,
     Change Password, and Delete Account.
+
+    The API Keys tab's content is admin-only (see _render_own_api_keys_form) —
+    students and teachers see an informational note instead, since they draw
+    on the admin account's keys automatically and have nothing to configure.
     """
     st.title("Profile")
     user = st.session_state.user
@@ -1643,129 +1804,15 @@ def profile_page():
     # whether a key is currently stored without revealing its value.
     # ------------------------------------------------------------------
     with tab_keys:
-        st.subheader("AI API Keys")
-        st.caption(
-            "API keys are stored in your account and used by AI features "
-            "throughout the application."
-        )
-
-        chatgpt_saved    = bool(user.get("chatgpt_api_key"))
-        gemini_saved     = bool(user.get("gemini_api_key"))
-        groq_saved       = bool(user.get("groq_api_key"))
-        github_saved     = bool(user.get("github_token"))
-        elevenlabs_saved = bool(user.get("elevenlabs_api_key"))
-        cartesia_saved   = bool(user.get("cartesia_api_key"))
-
-        with st.form("api_keys_form"):
-            st.markdown("**LLM Provider Keys**")
-            k1, k2 = st.columns(2)
-            with k1:
-                # chatgpt_api_key doubles as the OpenAI key for UReap.
-                # UReap reads st.session_state.openai_api_key at runtime,
-                # which is populated from this column at login.
-                cgpt = st.text_input(
-                    "ChatGPT / OpenAI API Key",
-                    value=user.get("chatgpt_api_key") or "",
-                    type="password",
-                    placeholder="Enter API key",
-                )
-                groq = st.text_input(
-                    "Groq API Key",
-                    value=user.get("groq_api_key") or "",
-                    type="password",
-                    placeholder="Enter API key",
-                    help="Used for Llama 3.3-70B via the Groq inference API.",
-                )
-            with k2:
-                gem = st.text_input(
-                    "Google Gemini API Key",
-                    value=user.get("gemini_api_key") or "",
-                    type="password",
-                    placeholder="Enter API key",
-                )
-                github = st.text_input(
-                    "GitHub Token",
-                    value=user.get("github_token") or "",
-                    type="password",
-                    placeholder="Enter API key",
-                    help="Used for GPT-4o via GitHub Models.",
-                )
-
-            st.divider()
-            st.markdown("**Text-to-Speech Keys**")
-            tts1, tts2 = st.columns(2)
-            with tts1:
-                elevenlabs = st.text_input(
-                    "ElevenLabs API Key",
-                    value=user.get("elevenlabs_api_key") or "",
-                    type="password",
-                    placeholder="Enter API key",
-                )
-            with tts2:
-                cartesia = st.text_input(
-                    "Cartesia API Key",
-                    value=user.get("cartesia_api_key") or "",
-                    type="password",
-                    placeholder="Enter API key",
-                )
-
-            save_keys = st.form_submit_button("Save API Keys", type="primary")
-
-        if save_keys:
-            # Blank strings are stored as None so the not-set indicator works
-            # correctly on the next render.
-            cgpt       = cgpt.strip()       or None
-            gem        = gem.strip()        or None
-            groq       = groq.strip()       or None
-            github     = github.strip()     or None
-            elevenlabs = elevenlabs.strip() or None
-            cartesia   = cartesia.strip()   or None
-
-            api_key_errors = [
-                validate_api_key(cgpt,       "ChatGPT / OpenAI"),
-                validate_api_key(gem,        "Gemini"),
-                validate_api_key(groq,       "Groq"),
-                validate_api_key(github,     "GitHub Token"),
-                validate_api_key(elevenlabs, "ElevenLabs"),
-                validate_api_key(cartesia,   "Cartesia"),
-            ]
-            api_key_errors = [msg for msg in api_key_errors if msg]
-            if api_key_errors:
-                # Display errors without returning early so all other tabs
-                # remain accessible.
-                show_errors(api_key_errors)
-            else:
-                update_user_api_keys(
-                    user["id"], cgpt, gem, groq, github, elevenlabs, cartesia
-                )
-                st.session_state.user.update({
-                    "chatgpt_api_key":    cgpt,
-                    "gemini_api_key":     gem,
-                    "groq_api_key":       groq,
-                    "github_token":       github,
-                    "elevenlabs_api_key": elevenlabs,
-                    "cartesia_api_key":   cartesia,
-                })
-                # Keep the session state root-level keys in sync so that
-                # llm_utils.py, which reads these directly from st.session_state
-                # (not from st.session_state.user), picks up the updated values.
-                st.session_state["openai_api_key"] = cgpt
-                st.session_state["groq_api_key"]   = groq
-                st.session_state["gemini_api_key"] = gem
-                st.session_state["github_token"]   = github
-                st.toast("API keys saved.")
-                st.rerun()
-
-        # ── API key links ─────────────────────────────────────────────────────
-        st.divider()
-        st.write("Enter your API keys to use cloud-based models:")
-        st.markdown("""
-🔑 Get your API keys:
-- [OpenAI API Key](https://platform.openai.com/api-keys)
-- [GitHub Token](https://github.com/settings/personal-access-tokens)
-- [Gemini API Key](https://aistudio.google.com/apikey)
-- [Groq API Key](https://console.groq.com/keys)
-""")
+        if user.get("role") == "admin":
+            _render_own_api_keys_form(user)
+        else:
+            st.subheader("AI API Keys")
+            st.info(
+                "AI features in this app run on a shared API key managed by "
+                "your administrator. You don't need to provide your own key "
+                "— there's nothing to configure here."
+            )
 
     # ------------------------------------------------------------------
     # Tab 3: Model Preferences

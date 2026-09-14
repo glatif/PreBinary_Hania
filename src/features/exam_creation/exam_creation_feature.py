@@ -46,7 +46,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from db import get_connection, get_engine
 from auth import save_uploaded_file, delete_physical_file
 
-from src.utils.llm_utils import MODELS, generate_llm_response, strip_llm_json
+from src.utils.llm_utils import MODELS, generate_llm_response, strip_llm_json, missing_key_warning
 from src.utils.pdf_utils import extract_text_from_pdf, save_uploaded_pdf
 
 
@@ -896,9 +896,9 @@ def exam_creation_ui() -> None:
             selected_model = MODELS[selected_model_key]
 
             if selected_model == "llama-3.3-70b-groq" and not st.session_state.get("groq_api_key"):
-                st.warning("⚠️ Groq API key is required. Please add your API key in your profile settings.")
+                st.warning(missing_key_warning("Groq API key"))
             if selected_model == "gemini-3.6-flash" and not st.session_state.get("gemini_api_key"):
-                st.warning("⚠️ Gemini API key is required. Please add your API key in your profile settings.")
+                st.warning(missing_key_warning("Gemini API key"))
 
             if st.button("Generate Question Variations"):
                 with st.spinner("Generating question variations..."):
@@ -1127,9 +1127,9 @@ def exam_creation_ui() -> None:
             selected_model = MODELS[selected_model_key]
 
             if selected_model == "llama-3.3-70b-groq" and not st.session_state.get("groq_api_key"):
-                st.warning("⚠️ Groq API key is required. Please add your API key in your profile settings.")
+                st.warning(missing_key_warning("Groq API key"))
             if selected_model == "gemini-3.6-flash" and not st.session_state.get("gemini_api_key"):
-                st.warning("⚠️ Gemini API key is required. Please add your API key in your profile settings.")
+                st.warning(missing_key_warning("Gemini API key"))
 
             if st.button("Generate Exam Questions"):
                 with st.spinner("Generating exam questions..."):

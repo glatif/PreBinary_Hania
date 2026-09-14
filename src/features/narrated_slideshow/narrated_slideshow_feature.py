@@ -58,7 +58,7 @@ except ImportError as e:
         pass
 
 # Import existing LLM utilities
-from src.utils.llm_utils import MODELS, MODEL_PROVIDERS
+from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, missing_key_warning
 
 def log_debug(phase: str, status: str, message: str) -> None:
     """Log debug messages with consistent formatting"""
@@ -601,15 +601,15 @@ def generate_quiz_questions_wrapper():
     
     # Check API key availability
     if model_provider == "groq" and not st.session_state.get("groq_api_key"):
-        st.error("⚠️ Groq API key is required for this model. Please add your API key in your profile settings.")
+        st.error(missing_key_warning("Groq API key"))
         return
     elif model_provider == "openai" and not st.session_state.get("openai_api_key"):
-        st.error("⚠️ OpenAI API key is required for this model. Please add your API key in your profile settings.")
+        st.error(missing_key_warning("OpenAI API key"))
         return
     elif model_provider == "gemini" and not st.session_state.get("gemini_api_key"):
-        st.error("⚠️ Gemini API key is required for this model. Please add your API key in your profile settings.")
+        st.error(missing_key_warning("Gemini API key"))
         return
-    
+
     with st.spinner("🎯 Generating intelligent quiz questions... This may take a moment."):
         try:
             log_debug("QUIZ", "INFO", f"Using model: {model_id} for quiz generation")
@@ -674,15 +674,15 @@ def generate_narrations():
     
     # Check API key availability
     if model_provider == "groq" and not st.session_state.get("groq_api_key"):
-        st.error("⚠️ Groq API key is required for this model. Please add your API key in your profile settings.")
+        st.error(missing_key_warning("Groq API key"))
         return
     elif model_provider == "openai" and not st.session_state.get("openai_api_key"):
-        st.error("⚠️ OpenAI API key is required for this model. Please add your API key in your profile settings.")
+        st.error(missing_key_warning("OpenAI API key"))
         return
     elif model_provider == "gemini" and not st.session_state.get("gemini_api_key"):
-        st.error("⚠️ Gemini API key is required for this model. Please add your API key in your profile settings.")
+        st.error(missing_key_warning("Gemini API key"))
         return
-    
+
     with st.spinner("🎬 Generating AI narrations... This may take a few minutes."):
         try:
             log_debug("NARRATION", "INFO", f"Using display name: {selected_model_display}, model ID: {model_id}, provider: {model_provider}")

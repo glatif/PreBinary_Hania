@@ -38,7 +38,7 @@ from typing import List, Dict, Any
 from db import get_connection
 from auth import save_uploaded_file, delete_physical_file
 
-from src.utils.llm_utils import MODELS, generate_llm_response, MODEL_PROVIDERS, strip_llm_json
+from src.utils.llm_utils import MODELS, generate_llm_response, MODEL_PROVIDERS, strip_llm_json, missing_key_warning
 from src.utils.pdf_utils import extract_text_from_pdf, save_uploaded_pdf
 from src.features.exam_verification.exam_verification_feature import (
     verify_student_identity,
@@ -1879,9 +1879,9 @@ def exam_grading_ui() -> None:
             selected_model = MODELS[selected_model_key]
 
             if selected_model == "llama-3.3-70b-groq" and not st.session_state.get("groq_api_key"):
-                st.warning("⚠️ Groq API key is required. Please add your API key in your profile settings.")
+                st.warning(missing_key_warning("Groq API key"))
             if selected_model == "gemini-3.6-flash" and not st.session_state.get("gemini_api_key"):
-                st.warning("⚠️ Gemini API key is required. Please add your API key in your profile settings.")
+                st.warning(missing_key_warning("Gemini API key"))
 
             if st.button("Grade All Submissions"):
                 grading_session_id = str(uuid.uuid4())
