@@ -1174,12 +1174,14 @@ CREATE TABLE oral_exam_responses (
     question_text   TEXT         NOT NULL,
     audio_file_path VARCHAR(500) NULL,
     transcript      TEXT,
+    transcript_status ENUM('not_applicable', 'pending', 'done', 'failed') NOT NULL DEFAULT 'pending',
     skipped         TINYINT(1)   NOT NULL DEFAULT 0,
     answered_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
     FOREIGN KEY (student_id)    REFERENCES users(id)       ON DELETE CASCADE,
     INDEX idx_oral_response_session (session_id),
+    INDEX idx_oral_response_transcript_status (transcript_status),
     UNIQUE KEY uq_oral_response_question (assessment_id, student_id, question_number)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

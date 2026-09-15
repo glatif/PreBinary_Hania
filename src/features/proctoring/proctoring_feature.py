@@ -3471,3 +3471,35 @@ def render_proctor_monitor(gate_key: str, user: dict, quiz_id, assessment_id) ->
         )
 
     return session_id
+
+
+def is_proctoring_fully_active(gate_key: str) -> bool:
+    """
+    True once every capture render_proctor_monitor() actually asked for
+    (given this gate_key) has been explicitly granted by the browser —
+    screen share and microphone always, webcam only when the admin's
+    get_record_webcam_video() setting had it on for this session.
+
+    render_proctor_monitor() itself never blocks on this — it only requests
+    permissions and keeps recording whatever is granted, so that a partial
+    grant (e.g. mic denied) still captures what it can rather than losing
+    everything. Callers that must not reveal assessment content until
+    proctoring is genuinely live (not just requested) — see Oral
+    Examination — check this separately, after render_proctor_monitor()
+    has been called for the same gate_key on this rerun.
+    """
+    share_status = st.session_state.get(f"proctor_share_status_{gate_key}")
+    audio_status = st.session_state.get(f"proctor_audio_status_{gate_key}")
+    if share_status != "granted" or audio_status != "granted":
+        return False
+
+    # Mirrors the once-per-session fetch in render_proctor_monitor() — falls
+    # back to the live admin setting if this gate_key's monitor hasn't been
+    # mounted yet this session, so a caller checking before the first mount
+    # still gets a correct answer rather than a stale/missing key.
+    webcam_setting_key = f"proctor_record_webcam_{gate_key}"
+    webcam_enabled = st.session_state.get(webcam_setting_key, get_record_webcam_video())
+    if webcam_enabled and st.session_state.get(f"proctor_webcam_status_{gate_key}") != "granted":
+        return False
+
+    return True

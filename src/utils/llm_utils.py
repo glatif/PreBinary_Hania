@@ -78,25 +78,6 @@ MODEL_PROVIDERS = {
     "gpt-4o-github": "github",
 }
 
-def missing_key_warning(credential_label: str) -> str:
-    """
-    Build the warning shown when a provider credential isn't available.
-
-    Students and teachers no longer maintain their own AI provider keys —
-    their session is flattened from the admin account's keys at login (see
-    get_admin_api_keys() in auth.py), regardless of what's on their own
-    record. So when a credential is still missing for those roles, the fix
-    is on the admin's end; only an admin account is told to add it directly.
-
-    Args:
-        credential_label: e.g. "Groq API key", "GitHub token".
-    """
-    role = st.session_state.get("user", {}).get("role")
-    if role == "admin":
-        return f"⚠️ {credential_label} is required. Please add it in your profile settings."
-    return f"⚠️ {credential_label} is required and isn't currently configured. Contact your administrator."
-
-
 def stream_local_llm(prompt: str, model_name: str, api_url: str = OLLAMA_API_URL) -> Generator[str, None, None]:
     """
     Stream responses from a local LLM using Ollama API
@@ -306,10 +287,34 @@ def _transcribe_audio_gemini(audio_bytes: bytes, filename: str, api_key: str) ->
     try:
         response = requests.post(endpoint, json=payload, headers=headers, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
-        result = response.json()
-        return result["candidates"][0]["content"]["parts"][0]["text"]
     except requests.exceptions.RequestException as e:
         return f"Error: Failed to transcribe audio via Gemini. Details: {str(e)}"
+
+    result = response.json()
+    candidates = result.get("candidates") or []
+    if not candidates:
+        # A fully empty response — most commonly the whole request was
+        # blocked before any candidate was generated (see promptFeedback).
+        block_reason = result.get("promptFeedback", {}).get("blockReason")
+        return (
+            f"Error: Gemini returned no transcript (blocked: {block_reason})."
+            if block_reason
+            else "Error: Gemini returned no transcript for this recording."
+        )
+
+    candidate = candidates[0]
+    parts = candidate.get("content", {}).get("parts")
+    if not parts:
+        # A candidate exists but has no text — e.g. finishReason "SAFETY" or
+        # "RECITATION" cut generation short before any content was produced.
+        # This is a real, silent-audio/false-positive-safety-filter case
+        # encountered in practice, not a hypothetical — surface the reason
+        # rather than letting a bare KeyError bubble up as a generic
+        # "Could not submit your answer" to the student.
+        finish_reason = candidate.get("finishReason", "unknown")
+        return f"Error: Gemini did not return a transcript for this recording (reason: {finish_reason})."
+
+    return parts[0].get("text", "")
 
 
 def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
@@ -334,18 +339,36 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
     Returns:
         The transcript text, or an error string prefixed with 'Error:'.
     """
-    if st.session_state.get("groq_api_key"):
+    return _transcribe_audio_with_keys(
+        audio_bytes, filename,
+        groq_key=st.session_state.get("groq_api_key"),
+        gemini_key=st.session_state.get("gemini_api_key"),
+        openai_key=st.session_state.get("openai_api_key"),
+    )
+
+
+def _transcribe_audio_with_keys(
+    audio_bytes: bytes, filename: str, groq_key: str = None, gemini_key: str = None, openai_key: str = None
+) -> str:
+    """
+    Same Groq-then-Gemini-then-OpenAI dispatch as transcribe_audio(), but
+    taking the keys directly as arguments instead of reading
+    st.session_state — the piece transcribe_audio() and
+    transcribe_audio_for_user() both delegate to, so the provider-priority
+    logic exists in exactly one place regardless of where the keys came from.
+    """
+    if groq_key:
         return _transcribe_audio_openai_compatible(
-            audio_bytes, filename, st.session_state.groq_api_key,
+            audio_bytes, filename, groq_key,
             url="https://api.groq.com/openai/v1/audio/transcriptions",
             model="whisper-large-v3-turbo",
             provider_label="Groq",
         )
-    if st.session_state.get("gemini_api_key"):
-        return _transcribe_audio_gemini(audio_bytes, filename, st.session_state.gemini_api_key)
-    if st.session_state.get("openai_api_key"):
+    if gemini_key:
+        return _transcribe_audio_gemini(audio_bytes, filename, gemini_key)
+    if openai_key:
         return _transcribe_audio_openai_compatible(
-            audio_bytes, filename, st.session_state.openai_api_key,
+            audio_bytes, filename, openai_key,
             url="https://api.openai.com/v1/audio/transcriptions",
             model="whisper-1",
             provider_label="OpenAI",
@@ -353,6 +376,42 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
     return (
         "Error: No speech-to-text provider configured. Add a Groq, OpenAI, "
         "or Gemini API key in your profile settings."
+    )
+
+
+def transcribe_audio_for_user(audio_bytes: bytes, filename: str, user_id: int) -> str:
+    """
+    DB-driven variant of transcribe_audio() for use outside a Streamlit
+    session — e.g. the Oral Examination background transcription sweep
+    (process_pending_oral_transcriptions() in oral_examination_feature.py),
+    which runs in a daemon thread with no st.session_state for the student
+    whose answer it's transcribing. Reads that student's own saved API keys
+    straight from the users table instead.
+    """
+    from db import get_connection
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT chatgpt_api_key, gemini_api_key, groq_api_key FROM users WHERE id = %s",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+    if not row:
+        return (
+            "Error: No speech-to-text provider configured. Add a Groq, OpenAI, "
+            "or Gemini API key in your profile settings."
+        )
+    return _transcribe_audio_with_keys(
+        audio_bytes, filename,
+        groq_key=row.get("groq_api_key"),
+        gemini_key=row.get("gemini_api_key"),
+        openai_key=row.get("chatgpt_api_key"),
     )
 
 

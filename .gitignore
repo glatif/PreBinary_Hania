@@ -48,6 +48,7 @@ temp_uploads/
 uploads/
 grading_results.csv
 keys.txt
+*.log
 
 # Runtime-generated proctoring/verification data — verification_photos holds
 # actual captured ID-card/selfie images (sensitive), question_audio is

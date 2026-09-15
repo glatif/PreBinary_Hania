@@ -41,6 +41,8 @@
 import base64
 import hashlib
 import json
+import threading
+import time
 import uuid
 from pathlib import Path
 import streamlit as st
@@ -50,7 +52,7 @@ from typing import List, Dict, Any
 from db import get_connection
 from auth import save_uploaded_file
 
-from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, generate_llm_response, strip_llm_json, transcribe_audio, missing_key_warning
+from src.utils.llm_utils import MODELS, MODEL_PROVIDERS, generate_llm_response, strip_llm_json, transcribe_audio_for_user
 from src.features.exam_verification.exam_verification_feature import (
     verify_student_identity,
     get_verification_admin_settings,
@@ -66,6 +68,7 @@ from src.features.quiz_generator.document_processor import (
 from src.utils.attempt_log import log_attempt_event, get_incomplete_attempts
 from src.features.proctoring.proctoring_feature import (
     render_proctor_monitor,
+    is_proctoring_fully_active,
     get_proctoring_admin_lock,
     effective_enable_proctoring,
     get_proctor_summary_by_user_assessment,
@@ -239,6 +242,7 @@ def save_oral_exam_response(
     question_text: str,
     audio_file_path: str = None,
     transcript: str = None,
+    transcript_status: str = "pending",
     skipped: bool = False,
 ) -> None:
     """
@@ -247,6 +251,15 @@ def save_oral_exam_response(
     audio_file_path/transcript are None when skipped=True — a student who
     skips a question never records anything, unlike a transcription failure
     (which still has real audio on disk and an "Error: ..." transcript).
+
+    transcript_status defaults to "pending": the normal student-submit path
+    (_render_student_oral_exam) saves the audio immediately and leaves
+    transcription for process_pending_oral_transcriptions() to pick up
+    afterward (background sweep or the on-demand call right before grading),
+    rather than blocking the student on a live transcription API call. Pass
+    "not_applicable" for a skipped question, or "done"/"failed" if a caller
+    already has a real transcript in hand (e.g. a background sweep updating
+    a row it just transcribed — see process_pending_oral_transcriptions()).
 
     Upserted on the (assessment_id, student_id, question_number) unique key
     rather than a blind INSERT — a double-click on "Submit Answer" or a
@@ -260,17 +273,22 @@ def save_oral_exam_response(
         cursor.execute(
             """
             INSERT INTO oral_exam_responses
-                (session_id, assessment_id, student_id, question_number, question_text, audio_file_path, transcript, skipped)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (session_id, assessment_id, student_id, question_number, question_text,
+                 audio_file_path, transcript, transcript_status, skipped)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
-                session_id      = VALUES(session_id),
-                question_text   = VALUES(question_text),
-                audio_file_path = VALUES(audio_file_path),
-                transcript      = VALUES(transcript),
-                skipped         = VALUES(skipped),
-                answered_at     = CURRENT_TIMESTAMP
+                session_id        = VALUES(session_id),
+                question_text     = VALUES(question_text),
+                audio_file_path    = VALUES(audio_file_path),
+                transcript         = VALUES(transcript),
+                transcript_status  = VALUES(transcript_status),
+                skipped            = VALUES(skipped),
+                answered_at        = CURRENT_TIMESTAMP
             """,
-            (session_id, assessment_id, student_id, question_number, question_text, audio_file_path, transcript, skipped),
+            (
+                session_id, assessment_id, student_id, question_number, question_text,
+                audio_file_path, transcript, transcript_status, skipped,
+            ),
         )
         conn.commit()
     finally:
@@ -285,7 +303,7 @@ def get_oral_exam_responses(assessment_id: int, student_id: int) -> List[Dict]:
     try:
         cursor.execute(
             """
-            SELECT question_number, question_text, audio_file_path, transcript, skipped, answered_at
+            SELECT question_number, question_text, audio_file_path, transcript, transcript_status, skipped, answered_at
             FROM oral_exam_responses
             WHERE assessment_id = %s AND student_id = %s
             ORDER BY question_number ASC
@@ -309,7 +327,7 @@ def get_oral_exam_responses_for_assessment(assessment_id: int) -> List[Dict]:
     try:
         cursor.execute(
             """
-            SELECT student_id, question_number, question_text, audio_file_path, transcript, skipped, answered_at
+            SELECT student_id, question_number, question_text, audio_file_path, transcript, transcript_status, skipped, answered_at
             FROM oral_exam_responses
             WHERE assessment_id = %s
             ORDER BY student_id ASC, question_number ASC
@@ -320,6 +338,132 @@ def get_oral_exam_responses_for_assessment(assessment_id: int) -> List[Dict]:
     finally:
         cursor.close()
         conn.close()
+
+
+# =============================================================================
+# BACKGROUND TRANSCRIPTION — deferred off the student's Stop & Submit path
+# =============================================================================
+# Mirrors process_pending_proctor_analysis()/start_proctor_analysis_scheduler()
+# in proctoring_feature.py exactly: save fast at capture time (transcript_status
+# = 'pending'), do the slow work later, either via a periodic background sweep
+# or an on-demand call — here, right before grading (see
+# _render_oral_exam_grading()) so a transcript is always ready by grading time
+# even if the sweep hasn't reached a row yet.
+
+def process_pending_oral_transcriptions(
+    assessment_id: int = None,
+    student_id: int = None,
+    retry_failed: bool = False,
+    limit: int = 200,
+) -> dict:
+    """
+    Transcribe every oral_exam_responses row still awaiting it.
+
+    Processes transcript_status = 'pending' rows, plus 'failed' ones too when
+    retry_failed=True (a real transcription failure — bad audio, provider
+    outage at the time — deserves one more attempt at the next natural
+    checkpoint rather than being stuck forever; grading calls this with
+    retry_failed=True for exactly that reason). Scoped by assessment_id,
+    optionally narrowed further to one student_id, or left unscoped to sweep
+    globally up to `limit` oldest-pending rows (the mode the background
+    thread below uses).
+
+    Each row is transcribed via transcribe_audio_for_user() — the DB-driven
+    variant, since this may run in a daemon thread with no Streamlit session
+    for the student whose answer it's transcribing — and updated in place:
+    transcript_status becomes 'done' on success or 'failed' on an "Error: ..."
+    result (transcribe_audio_for_user() never raises for a provider/network
+    failure, only for a genuinely unreadable audio file on disk, which is
+    caught here and also recorded as 'failed' rather than crashing the sweep).
+
+    Returns {"transcribed": int, "failed": int, "missing_file": int}.
+    """
+    statuses = ["pending", "failed"] if retry_failed else ["pending"]
+    status_placeholders = ", ".join(["%s"] * len(statuses))
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        where = [f"transcript_status IN ({status_placeholders})"]
+        params = list(statuses)
+        if assessment_id is not None:
+            where.append("assessment_id = %s")
+            params.append(assessment_id)
+        if student_id is not None:
+            where.append("student_id = %s")
+            params.append(student_id)
+        query = f"""
+            SELECT id, student_id, audio_file_path
+            FROM oral_exam_responses
+            WHERE {' AND '.join(where)}
+            ORDER BY answered_at ASC
+            LIMIT %s
+        """
+        cursor.execute(query, params + [limit])
+        rows = cursor.fetchall() or []
+    finally:
+        cursor.close()
+
+    transcribed = failed = missing_file = 0
+    write_cursor = conn.cursor()
+    try:
+        for row in rows:
+            path = Path(row["audio_file_path"]) if row["audio_file_path"] else None
+            if not path or not path.exists():
+                write_cursor.execute(
+                    "UPDATE oral_exam_responses SET transcript_status = 'failed', "
+                    "transcript = %s WHERE id = %s",
+                    ("Error: Recording file is missing on disk.", row["id"]),
+                )
+                missing_file += 1
+                continue
+
+            transcript = transcribe_audio_for_user(
+                path.read_bytes(), path.name, row["student_id"]
+            )
+            new_status = "failed" if transcript.startswith("Error:") else "done"
+            write_cursor.execute(
+                "UPDATE oral_exam_responses SET transcript = %s, transcript_status = %s WHERE id = %s",
+                (transcript, new_status, row["id"]),
+            )
+            if new_status == "done":
+                transcribed += 1
+            else:
+                failed += 1
+        conn.commit()
+    finally:
+        write_cursor.close()
+        conn.close()
+
+    return {"transcribed": transcribed, "failed": failed, "missing_file": missing_file}
+
+
+ORAL_TRANSCRIPTION_SWEEP_INTERVAL_SECONDS = 5 * 60  # more time-sensitive than
+# proctoring's 15-minute analysis sweep — a transcript blocks grading, a
+# webcam-frame flag doesn't, so pending answers shouldn't sit long.
+
+
+def _oral_transcription_background_loop() -> None:
+    """Runs forever in a daemon thread — see start_oral_transcription_scheduler()."""
+    while True:
+        time.sleep(ORAL_TRANSCRIPTION_SWEEP_INTERVAL_SECONDS)
+        try:
+            process_pending_oral_transcriptions()
+        except Exception:
+            pass
+
+
+@st.cache_resource(show_spinner=False)
+def start_oral_transcription_scheduler() -> bool:
+    """
+    Start the background oral-transcription sweep thread exactly once per
+    server process — st.cache_resource is what makes "exactly once" true
+    here regardless of how many sessions/reruns call this. Call once from
+    app.py at startup, same as start_proctor_analysis_scheduler().
+    """
+    thread = threading.Thread(target=_oral_transcription_background_loop, daemon=True)
+    thread.start()
+    return True
 
 
 def get_students_with_oral_responses(assessment_id: int) -> List[Dict]:
@@ -853,6 +997,10 @@ def _render_student_oral_exam(
                 st.markdown(f"**Q{r['question_number']}. {r['question_text']}**")
                 if r.get("skipped"):
                     st.caption("⏭️ Skipped — no answer provided.")
+                elif r.get("transcript_status") == "pending":
+                    st.caption("⏳ Transcribing your answer — check back shortly.")
+                elif r.get("transcript_status") == "failed":
+                    st.caption("⚠️ Could not transcribe this answer, but your recording was saved.")
                 else:
                     st.caption(r.get("transcript") or "(no transcript)")
         return
@@ -864,24 +1012,18 @@ def _render_student_oral_exam(
         "advance."
     )
 
-    # Spoken answers are transcribed via Groq, Gemini, or OpenAI (see
-    # transcribe_audio() in llm_utils.py) — there's no offline/local
-    # transcription option. Checked here, before identity verification and
-    # recording, so a student finds out up front rather than after already
-    # completing the camera verification and recording an answer that can't
-    # be transcribed. Students draw on the admin account's keys (flattened
-    # into session state at login, see get_admin_api_keys() in auth.py), so
-    # reaching this branch means the admin hasn't configured any of the
-    # three providers yet — not that the student is missing a key of their own.
-    if (
-        not st.session_state.get("groq_api_key")
-        and not st.session_state.get("gemini_api_key")
-        and not st.session_state.get("openai_api_key")
-    ):
+    # Spoken answers are transcribed via Groq or OpenAI's Whisper endpoint
+    # (see transcribe_audio_for_user() in llm_utils.py, called by the
+    # background sweep — process_pending_oral_transcriptions() below) —
+    # there's no offline/local transcription option. Checked here, before
+    # identity verification and recording, so a student finds out up front
+    # rather than after already completing the camera verification and
+    # recording an answer that can't be transcribed.
+    if not st.session_state.get("groq_api_key") and not st.session_state.get("openai_api_key"):
         st.warning(
-            "⚠️ This oral exam requires a Groq, Gemini, or OpenAI API key to transcribe "
-            "spoken answers, and none is currently configured. Contact your administrator "
-            "to have one set up, then come back here to start the exam."
+            "⚠️ This oral exam requires a Groq or OpenAI API key on your account to transcribe "
+            "your spoken answers — neither is set. Go to **Profile → AI API Keys**, save a Groq "
+            "or OpenAI key, then come back here to start the exam."
         )
         return
 
@@ -898,14 +1040,28 @@ def _render_student_oral_exam(
         st.session_state[session_key] = str(uuid.uuid4())
     session_id = st.session_state[session_key]
 
+    proctoring_gate_key = f"oral_exam_{assessment_id}"
     proctoring_enabled = effective_enable_proctoring(setup.get("enable_proctoring", True))
     if proctoring_enabled:
         render_proctor_monitor(
-            gate_key=f"oral_exam_{assessment_id}",
+            gate_key=proctoring_gate_key,
             user=user,
             quiz_id=None,
             assessment_id=assessment_id,
         )
+        # No question is revealed, and no recording starts, until screen
+        # share, microphone, and (if the admin has it enabled) webcam have
+        # all actually been granted — render_proctor_monitor() itself only
+        # requests permissions and keeps going with whatever is granted, so
+        # this check is what actually stops a student from answering with
+        # proctoring only partially live or still pending a browser prompt.
+        if not is_proctoring_fully_active(proctoring_gate_key):
+            st.warning(
+                "⏳ Waiting for screen share, microphone, and camera permissions "
+                "above to be granted — the question will appear once proctoring "
+                "is fully active."
+            )
+            return
 
     if verification_required:
         st.success("Identity verified. Proctoring is active for the remainder of this exam.")
@@ -991,6 +1147,7 @@ def _render_student_oral_exam(
             student_id=int(user["id"]),
             question_number=next_question["question_number"],
             question_text=next_question["question_text"],
+            transcript_status="not_applicable",
             skipped=True,
         )
         log_attempt_event(
@@ -1072,7 +1229,7 @@ def _render_student_oral_exam(
     if pending:
         if pending.get("auto_submitted"):
             st.info("⏰ Time's up — your answer is being submitted automatically.")
-        with st.spinner("Saving and transcribing your answer..."):
+        with st.spinner("Saving your answer..."):
             try:
                 audio_bytes = pending["bytes"]
                 audio_name = f"answer.{pending['ext']}"
@@ -1084,57 +1241,47 @@ def _render_student_oral_exam(
                     course_id=course_id,
                     feature_name="oral_examination_response",
                 )
-                transcript = transcribe_audio(audio_bytes, audio_name)
-                # transcribe_audio() reports failures as an "Error: ..." string
-                # rather than raising (see llm_utils.py), so that it can be
-                # displayed directly like generate_llm_response()'s errors. A
-                # failed transcript must NOT be saved as the student's answer —
-                # it would otherwise be graded as if it were real speech. The
-                # audio itself is already safely on disk at saved_path, and
-                # the raw bytes are still in pending_key, so the student can
-                # retry transcription without re-recording.
-                if transcript.startswith("Error:"):
-                    st.error(
-                        f"Could not transcribe your answer: {transcript} "
-                        "Your recording was not lost."
-                    )
-                    if st.button(
-                        "Retry Transcription",
-                        key=f"oral_retry_{assessment_id}_{next_question['question_number']}",
-                    ):
-                        st.rerun()
-                else:
-                    save_oral_exam_response(
-                        session_id=session_id,
-                        assessment_id=assessment_id,
-                        student_id=int(user["id"]),
-                        question_number=next_question["question_number"],
-                        question_text=next_question["question_text"],
-                        audio_file_path=saved_path,
-                        transcript=transcript,
-                    )
+                # Transcription is deliberately NOT done here — it used to run
+                # synchronously via transcribe_audio(), which meant every
+                # "Stop & Submit" blocked the student on a live LLM call (up
+                # to LLM_REQUEST_TIMEOUT_SECONDS). Only the audio is saved on
+                # this path now; process_pending_oral_transcriptions() picks
+                # up every 'pending' row afterward, via the background sweep
+                # thread (see start_oral_transcription_scheduler()) and again
+                # on-demand right before grading, so a transcript is always
+                # ready by the time a teacher grades even if the sweep hasn't
+                # reached this row yet.
+                save_oral_exam_response(
+                    session_id=session_id,
+                    assessment_id=assessment_id,
+                    student_id=int(user["id"]),
+                    question_number=next_question["question_number"],
+                    question_text=next_question["question_text"],
+                    audio_file_path=saved_path,
+                    transcript_status="pending",
+                )
+                log_attempt_event(
+                    user_id=int(user["id"]),
+                    assessment_id=assessment_id,
+                    feature_name="oral_examination",
+                    event_type="timed_out" if pending.get("auto_submitted") else "answer_submitted",
+                    session_id=session_id,
+                    question_number=next_question["question_number"],
+                )
+                # This save is the last question exactly when it brings
+                # the answered count up to total_questions — that's the
+                # terminal event get_incomplete_attempts() looks for, so
+                # a fully-finished attempt stops showing up as abandoned.
+                if len(existing) + 1 >= total_questions:
                     log_attempt_event(
                         user_id=int(user["id"]),
                         assessment_id=assessment_id,
                         feature_name="oral_examination",
-                        event_type="timed_out" if pending.get("auto_submitted") else "answer_submitted",
+                        event_type="completed",
                         session_id=session_id,
-                        question_number=next_question["question_number"],
                     )
-                    # This save is the last question exactly when it brings
-                    # the answered count up to total_questions — that's the
-                    # terminal event get_incomplete_attempts() looks for, so
-                    # a fully-finished attempt stops showing up as abandoned.
-                    if len(existing) + 1 >= total_questions:
-                        log_attempt_event(
-                            user_id=int(user["id"]),
-                            assessment_id=assessment_id,
-                            feature_name="oral_examination",
-                            event_type="completed",
-                            session_id=session_id,
-                        )
-                    del st.session_state[pending_key]
-                    st.rerun()
+                del st.session_state[pending_key]
+                st.rerun()
             except Exception as exc:
                 st.error(f"Could not submit your answer: {exc}")
 
@@ -1512,9 +1659,9 @@ def _render_oral_exam_grading(assessment_id: int) -> None:
     selected_model = MODELS[selected_model_key]
 
     if selected_model == "llama-3.3-70b-groq" and not st.session_state.get("groq_api_key"):
-        st.warning(missing_key_warning("Groq API key"))
+        st.warning("⚠️ Groq API key is required. Please add your API key in your profile settings.")
     if selected_model == "gemini-3.6-flash" and not st.session_state.get("gemini_api_key"):
-        st.warning(missing_key_warning("Gemini API key"))
+        st.warning("⚠️ Gemini API key is required. Please add your API key in your profile settings.")
 
     st.caption(
         "Each answer is graded with one LLM call, one at a time — a full class "
@@ -1530,6 +1677,16 @@ def _render_oral_exam_grading(assessment_id: int) -> None:
 
         progress_bar = st.progress(0)
         status_text = st.empty()
+
+        # Answers are saved with transcript_status = 'pending' at submit time
+        # (see _render_student_oral_exam) and normally picked up by the
+        # background sweep thread within ORAL_TRANSCRIPTION_SWEEP_INTERVAL_SECONDS
+        # — but grading shouldn't have to wait on that timer, so do one
+        # synchronous pass right here first. retry_failed=True also gives any
+        # previously-failed row (a transient provider error, say) one more
+        # attempt at this natural checkpoint.
+        status_text.text("Transcribing any pending answers...")
+        process_pending_oral_transcriptions(assessment_id=assessment_id, retry_failed=True)
 
         # Fetched once for the whole assessment rather than once per student —
         # grading a class of 30 would otherwise issue 30 separate round-trips
