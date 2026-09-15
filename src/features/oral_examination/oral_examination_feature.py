@@ -83,6 +83,7 @@ from src.features.proctoring.proctoring_feature import (
     format_mouse_events_for_display,
     get_or_build_proctor_video_by_user_assessment,
     get_or_build_combined_proctor_video_by_user_assessment,
+    delete_proctor_data_for_user_assessment,
 )
 
 
@@ -338,6 +339,69 @@ def get_oral_exam_responses_for_assessment(assessment_id: int) -> List[Dict]:
     finally:
         cursor.close()
         conn.close()
+
+
+def delete_oral_exam_submission(student_id: int, assessment_id: int) -> dict:
+    """
+    Permanently delete one student's entire oral exam submission for one
+    assessment: every answer audio file on disk, the oral_exam_responses rows
+    (audio path/transcript per question) and any oral_exam_grading_results
+    rows already scored for them.
+
+    Does NOT touch proctoring data (webcam/screen frames, tab-switch events,
+    keystrokes, mouse activity, audio clips) — that's recorded independently
+    of this table and must be removed separately via
+    delete_proctor_data_for_user_assessment() in proctoring_feature.py, the
+    same helper Exam Grading's "Delete Entire Submission" dialog uses.
+
+    Returns {"responses_deleted": int, "grading_results_deleted": int,
+    "files_removed": int}.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT audio_file_path FROM oral_exam_responses WHERE student_id = %s AND assessment_id = %s",
+            (student_id, assessment_id),
+        )
+        audio_paths = [row["audio_file_path"] for row in (cursor.fetchall() or []) if row["audio_file_path"]]
+    finally:
+        cursor.close()
+
+    files_removed = 0
+    for path_str in audio_paths:
+        try:
+            path = Path(path_str)
+            if path.exists():
+                path.unlink()
+                files_removed += 1
+        except Exception:
+            pass
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "DELETE FROM oral_exam_grading_results WHERE student_id = %s AND assessment_id = %s",
+            (student_id, assessment_id),
+        )
+        grading_results_deleted = cursor.rowcount
+
+        cursor.execute(
+            "DELETE FROM oral_exam_responses WHERE student_id = %s AND assessment_id = %s",
+            (student_id, assessment_id),
+        )
+        responses_deleted = cursor.rowcount
+
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {
+        "responses_deleted": responses_deleted,
+        "grading_results_deleted": grading_results_deleted,
+        "files_removed": files_removed,
+    }
 
 
 # =============================================================================
@@ -1607,6 +1671,39 @@ def _render_oral_exam_setup(assessment_id: int, set_by: int) -> None:
 # TEACHER/ADMIN — Grading Results
 # =============================================================================
 
+@st.dialog("Delete Entire Submission")
+def _dialog_delete_entire_oral_submission(
+    student_id: int,
+    student_name: str,
+    assessment_id: int,
+) -> None:
+    """
+    Confirmation modal for permanently deleting everything associated with one
+    student's oral exam submission: every answer's audio file and transcript
+    (oral_exam_responses), any grading already recorded for them
+    (oral_exam_grading_results), and all proctoring data captured while they
+    took it (webcam/screen frames, tab-switch events, keystroke and mouse
+    logs, audio clips) — mirrors Exam Grading's "Delete Entire Submission"
+    dialog, reusing the same delete_proctor_data_for_user_assessment() helper.
+    """
+    st.warning(
+        f"Are you sure you want to delete **{student_name}**'s entire oral "
+        f"exam submission — every answer's audio recording and transcript, "
+        f"any grading already recorded for it, and all monitoring data "
+        f"(webcam/screen frames, tab-switch events, keystroke and mouse "
+        f"activity logs, and audio clips) captured while they took it? "
+        f"This cannot be undone."
+    )
+    col1, col2 = st.columns(2)
+    if col1.button("Delete everything", type="primary", key="oral_full_dialog_confirm_delete"):
+        delete_oral_exam_submission(student_id, assessment_id)
+        delete_proctor_data_for_user_assessment(student_id, assessment_id)
+        st.toast("Submission and monitoring data deleted.")
+        st.rerun()
+    if col2.button("Cancel", key="oral_full_dialog_cancel_delete"):
+        st.rerun()
+
+
 def _render_oral_exam_grading(assessment_id: int) -> None:
     if not assessment_id:
         st.warning("Select a course and assessment first.")
@@ -1835,6 +1932,13 @@ def _render_oral_exam_grading(assessment_id: int) -> None:
             total_max = sum(r["max_points"] for r in rows)
 
             with st.expander(f"{student_name} — {total_score}/{total_max}"):
+                if st.button(
+                    "🗑️ Delete entire submission",
+                    key=f"oral_del_submission_{assessment_id}_{student_id}",
+                    help="Delete this student's answers, grading, and all monitoring data for this assessment",
+                ):
+                    _dialog_delete_entire_oral_submission(student_id, student_name, assessment_id)
+
                 for r in sorted(rows, key=lambda x: x["question_number"]):
                     st.markdown(f"**Q{r['question_number']}. {r['question_text']}**")
                     st.caption(f"Transcript: {r['transcript'] or '(none)'}")
