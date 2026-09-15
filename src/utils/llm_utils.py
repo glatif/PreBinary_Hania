@@ -78,6 +78,25 @@ MODEL_PROVIDERS = {
     "gpt-4o-github": "github",
 }
 
+def missing_key_warning(credential_label: str) -> str:
+    """
+    Build the warning shown when a provider credential isn't available.
+
+    Students and teachers no longer maintain their own AI provider keys —
+    their session is flattened from the admin account's keys at login (see
+    get_admin_api_keys() in auth.py), regardless of what's on their own
+    record. So when a credential is still missing for those roles, the fix
+    is on the admin's end; only an admin account is told to add it directly.
+
+    Args:
+        credential_label: e.g. "Groq API key", "GitHub token".
+    """
+    role = st.session_state.get("user", {}).get("role")
+    if role == "admin":
+        return f"⚠️ {credential_label} is required. Please add it in your profile settings."
+    return f"⚠️ {credential_label} is required and isn't currently configured. Contact your administrator."
+
+
 def stream_local_llm(prompt: str, model_name: str, api_url: str = OLLAMA_API_URL) -> Generator[str, None, None]:
     """
     Stream responses from a local LLM using Ollama API
